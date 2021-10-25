@@ -16,4 +16,4 @@ This DAC uses the https://github.com/SkynetLabs/skystandards data structures.
 
 ## TypeScript library
 
-[Link to install instructions and docs](TODO)
+[Link to install instructions and docs](https://github.com/redsolver/filesystem-dac/tree/main/library-ts)
