@@ -1,6 +1,6 @@
 {
   "name": "fs-dac-library",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "This library exposes a class that wraps the FileSystem DAC, created and hosted by redsolver.",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
