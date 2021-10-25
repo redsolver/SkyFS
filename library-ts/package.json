@@ -1,0 +1,40 @@
+{
+  "name": "fs-dac-library",
+  "version": "0.2.2",
+  "description": "This library exposes a class that wraps the FileSystem DAC, created and hosted by redsolver.",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "type": "module",
+  "files": [
+    "dist/*"
+  ],
+  "scripts": {
+    "build": "rimraf dist && tsc -p tsconfig.build.json && tsc -p tsconfig.build.cjs.json",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "redsolver",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/redsolver/filesystem-dac/issues"
+  },
+  "homepage": "https://github.com/redsolver/filesystem-dac",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "post-me": "^0.4.5",
+    "skynet-js": "^4.0.12-beta",
+    "skynet-mysky-utils": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^14.14.37",
+    "@typescript-eslint/eslint-plugin": "^4.21.0",
+    "@typescript-eslint/parser": "^4.21.0",
+    "eslint-plugin-jsdoc": "^32.3.0",
+    "prettier": "^2.2.1",
+    "rimraf": "^3.0.2",
+    "tsify": "^5.0.2",
+    "typescript": "^4.2.4"
+  }
+}

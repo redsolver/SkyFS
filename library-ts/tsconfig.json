@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "isolatedModules": true,
+    "sourceMap": true,
+    "strictNullChecks": true,
+    "strictPropertyInitialization": false,
+    "target": "esnext"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
