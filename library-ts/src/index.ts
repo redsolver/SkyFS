@@ -59,6 +59,7 @@ export class FileSystemDAC extends DacLibrary {
     fileData: FileData,
     mimeType: string,
     onProgress?: (progress: number) => void,
+    onChunk?: (blob: Blob) => void,
   ): Promise<Blob> {
     if (!this.connector) {
       throw new Error("Connector not initialized");
@@ -66,7 +67,7 @@ export class FileSystemDAC extends DacLibrary {
 
     return await this.connector.connection
       .remoteHandle()
-      .call("downloadFileData", fileData, mimeType, onProgress);
+      .call("downloadFileData", fileData, mimeType, onProgress, onChunk);
   }
 
   public async loadThumbnail(
