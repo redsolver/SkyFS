@@ -1,0 +1,32 @@
+name: filesystem_dac
+description: FS DAC for Skynet
+version: 0.6.0
+
+environment:
+  sdk: ">=2.12.0 <3.0.0"
+
+dependencies:
+  blurhash_dart: ^1.0.2
+  convert: ^3.0.1
+  crypto: ^3.0.1
+  exif: ^3.0.0
+  hive: ^2.0.4
+  id3: ^1.0.1
+  image: ^3.0.8
+  js_bindings: ^0.0.3
+  path: ^1.8.0
+  pool: ^1.5.0
+  skynet:
+    git:
+      url: https://github.com/redsolver/skynet.git
+      ref: experimental
+  sodium: ^1.0.0
+  state_notifier: ^0.7.1
+  universal_platform: ^1.0.0+1
+  flac_metadata:
+    git: https://github.com/redsolver/flac_metadata.git
+
+dev_dependencies:
+  build_runner: ^1.10.0
+  build_web_compilers: ^2.11.0
+  pedantic: ^1.9.0
