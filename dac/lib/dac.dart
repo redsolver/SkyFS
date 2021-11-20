@@ -705,6 +705,9 @@ class FileSystemDAC {
     if (uri.host == 'local') {
       if (rootAccessEnabled) {
         if (uri.pathSegments.length > 1 && uri.pathSegments[1] == DATA_DOMAIN) {
+          if (write) {
+            throw 'Writing to internal paths is forbidden';
+          }
           return;
         } else {
           return;
