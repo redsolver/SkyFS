@@ -1,6 +1,6 @@
 name: filesystem_dac
 description: FS DAC for Skynet
-version: 0.6.0
+version: 0.6.1
 
 environment:
   sdk: ">=2.12.0 <3.0.0"
@@ -13,7 +13,6 @@ dependencies:
   hive: ^2.0.4
   id3: ^1.0.1
   image: ^3.0.8
-  js_bindings: ^0.0.3
   path: ^1.8.0
   pool: ^1.5.0
   skynet:

@@ -26,10 +26,12 @@ import 'package:sodium/sodium.dart' hide Box;
 import 'package:state_notifier/state_notifier.dart';
 import 'package:image/image.dart' as img;
 import 'package:pinenacl/api.dart' as pinenacl;
+import 'package:skynet/src/encode_endian/encode_endian.dart';
+import 'package:skynet/src/encode_endian/base.dart';
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
-const maxChunkSize = 16 * 1024 * 1024;
+const maxChunkSize = 1 * 1024 * 1024;
 
 // ! IMPORTANT
 // ! paths allow ALL characters excluding /
@@ -1501,8 +1503,9 @@ class FileSystemDAC {
     ext['uploader'] = UniversalPlatform.isWeb ? 'fs-dac.hns:1' : 'vup.hns:1';
 
     final fileData = FileData(
-      chunkSize: maxChunkSize,
-      encryptionType: 'AEAD_XCHACHA20_POLY1305',
+      chunkSize: res.maxChunkSize,
+      encryptionType: res.encryptionType,
+      padding: res.padding,
       url: 'sia://${res.skylink}',
       key: base64Url.encode(res.secretKey),
       hash: multihash,
@@ -1746,6 +1749,194 @@ class FileSystemDAC {
 
     return transformer.map((event) => event.message);
   }
+
+  Future<Stream<Uint8List>> downloadAndDecryptFileInChunks(
+    FileData fileData, {
+    Function? onProgress,
+  }) async {
+    log('[download+decrypt] using libsodium_secretbox');
+
+    final chunkSize = fileData.chunkSize;
+
+    onProgress ??= (double progress) {
+      setFileState(
+        fileData.hash,
+        FileState(
+          type: FileStateType.downloading,
+          progress: progress,
+        ),
+      );
+    };
+
+    onProgress(0.0);
+
+    final totalEncSize = ((fileData.size / fileData.chunkSize).floor() *
+            (fileData.chunkSize + 16)) +
+        (fileData.size % fileData.chunkSize) +
+        16 +
+        fileData.padding;
+
+    final streamCtrl = StreamController<Uint8List>();
+
+    final secretKey = base64Url.decode(fileData.key);
+    final key = SecureKey.fromList(
+      sodium,
+      secretKey,
+    );
+
+    final url = Uri.parse(
+      client.resolveSkylink(
+        fileData.url,
+        trusted: true, // TODO Maybe remove this
+      )!,
+    );
+    final downloadStreamCtrl = StreamController<List<int>>();
+
+    StreamSubscription? sub;
+    int downloadedLength = 0;
+
+    void sendDownloadRequest() async {
+      try {
+        final request = http.Request('GET', url);
+        request.headers.addAll(client.headers ?? {});
+        request.headers['range'] = 'bytes=$downloadedLength-';
+
+        final response = await client.httpClient.send(request);
+
+        if (response.statusCode != 206) {
+          throw 'HTTP ${response.statusCode}';
+        }
+        // totalDownloadLength = response.contentLength!;
+        sub = response.stream.listen(
+          (value) {
+            downloadStreamCtrl.add(value);
+          },
+          onDone: () {
+            print('onDone');
+          },
+          onError: (e, st) {
+            print('onError');
+          },
+        );
+      } catch (e, st) {
+        print(e);
+        print(st);
+      }
+    }
+    // downloadStreamCtrl.addStream(response.stream);
+
+    final completer = Completer<bool>();
+
+    final List<int> data = [];
+    sendDownloadRequest();
+
+    // bool headerSent = false;
+
+    StreamSubscription? progressSub;
+
+    int lastDownloadedLength = 0;
+    DateTime lastDownloadedLengthTS = DateTime.now();
+
+    progressSub = Stream.periodic(Duration(milliseconds: 200)).listen((event) {
+      final progress = downloadedLength / totalEncSize;
+      onProgress!(progress);
+      if (downloadedLength != lastDownloadedLength) {
+        lastDownloadedLength = downloadedLength;
+        lastDownloadedLengthTS = DateTime.now();
+      } else {
+        final diff = DateTime.now().difference(lastDownloadedLengthTS);
+        print(diff);
+        if (diff > Duration(seconds: 20)) {
+          print('detected download issue, reconnecting...');
+          lastDownloadedLengthTS = DateTime.now();
+
+          sub?.cancel();
+          sendDownloadRequest();
+        }
+      }
+    });
+
+    int currentChunk = 0;
+
+    final _downloadSub = downloadStreamCtrl.stream.listen(
+      (List<int> newBytes) {
+        data.addAll(newBytes);
+
+        downloadedLength += newBytes.length;
+
+        while (data.length > (chunkSize + 16)) {
+          log('[download+decrypt] decrypt chunk...');
+
+          final nonce = Uint8List.fromList(
+            encodeEndian(
+              currentChunk,
+              sodium.crypto.secretBox.nonceBytes,
+              endianType: EndianType.littleEndian,
+            ) as List<int>,
+          );
+
+          final r = sodium.crypto.secretBox.openEasy(
+            cipherText: Uint8List.fromList(
+              data.sublist(0, chunkSize + 16),
+            ),
+            nonce: nonce,
+            key: key,
+          );
+          streamCtrl.add(r);
+
+          currentChunk++;
+
+          data.removeRange(0, chunkSize + 16);
+        }
+
+        if (downloadedLength == totalEncSize) {
+          log('[download+decrypt] decrypt final chunk...');
+
+          final nonce = Uint8List.fromList(
+            encodeEndian(
+              currentChunk,
+              sodium.crypto.secretBox.nonceBytes,
+              endianType: EndianType.littleEndian,
+            ) as List<int>,
+          );
+
+          final r = sodium.crypto.secretBox.openEasy(
+            cipherText: Uint8List.fromList(
+              data,
+            ),
+            nonce: nonce,
+            key: key,
+          );
+          if (fileData.padding > 0) {
+            log('[download+decrypt] remove padding...');
+            streamCtrl.add(r.sublist(0, r.length - fileData.padding));
+          } else {
+            streamCtrl.add(r);
+          }
+          downloadStreamCtrl.close();
+        }
+      },
+      onDone: () async {
+        await progressSub?.cancel();
+        await streamCtrl.close();
+        setFileState(
+          fileData.hash,
+          FileState(
+            type: FileStateType.idle,
+            progress: null,
+          ),
+        );
+
+        completer.complete(true);
+      },
+      onError: (e) {
+        // TODO Handle error
+      },
+      cancelOnError: true,
+    );
+
+    return streamCtrl.stream;
+  }
 /* 
   Future<EncryptAndUploadResponse> encryptAndUploadFile(
       Stream<Uint8List> stream, String fileMultiHash,
@@ -1925,10 +2116,16 @@ class UploadingFilesChangeNotifier
 class EncryptAndUploadResponse {
   final String skylink;
   final Uint8List secretKey;
+  final String encryptionType;
+  final int maxChunkSize;
+  final int padding;
   // final Uint8List nonce;
   EncryptAndUploadResponse({
     required this.skylink,
     required this.secretKey,
+    required this.encryptionType,
+    required this.maxChunkSize,
+    required this.padding,
     // required this.nonce,
   });
 }
