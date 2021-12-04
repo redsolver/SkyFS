@@ -1445,6 +1445,7 @@ class FileSystemDAC {
     required Function customEncryptAndUploadFileFunction,
     Function? generateMetadataWrapper,
     Map<String, dynamic> additionalExt = const {},
+    List<String>? hashes,
   }) async {
     Map<String, dynamic>? ext;
 
@@ -1509,6 +1510,7 @@ class FileSystemDAC {
       url: 'sia://${res.skylink}',
       key: base64Url.encode(res.secretKey),
       hash: multihash,
+      hashes: hashes,
       size: size,
       ts: nowTimestamp(),
       ext: ext,
