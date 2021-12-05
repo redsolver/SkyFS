@@ -8,6 +8,7 @@ import 'package:exif/exif.dart';
 import 'package:filesystem_dac/model/utils.dart';
 import 'package:flac_metadata/flac_metadata.dart';
 import 'package:path/path.dart';
+import 'package:retry/retry.dart';
 import 'package:universal_platform/universal_platform.dart';
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
@@ -1518,6 +1519,8 @@ class FileSystemDAC {
     return fileData;
   }
 
+  final uploadThumbnailPool = Pool(2);
+
   // TODO Use pool to prevent too many concurrent uploads
   Future<void> uploadThumbnail(String key, Uint8List bytes) async {
     final existing = await loadThumbnail(key);
@@ -1527,14 +1530,21 @@ class FileSystemDAC {
 
       final keyInBytes = base64Url.decode(parts[1]);
 
-      await mySkyProvider.setRawDataEncrypted(
-        temporaryThumbnailKeyPaths[parts[1]] ?? '',
-        bytes,
-        0,
-        customEncryptedFileSeed: hex.encode(
-          keyInBytes,
-        ),
-      );
+      await uploadThumbnailPool.withResource(() async {
+        log('uploading thumbnail');
+        final r = RetryOptions(maxAttempts: 12);
+        await r.retry(
+          () => mySkyProvider.setRawDataEncrypted(
+            temporaryThumbnailKeyPaths[parts[1]] ?? '',
+            bytes,
+            0,
+            customEncryptedFileSeed: hex.encode(
+              keyInBytes,
+            ),
+          ),
+          // retryIf: (e) => e is Exception,
+        );
+      });
     }
   }
 
