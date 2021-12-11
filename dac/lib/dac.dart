@@ -29,6 +29,7 @@ import 'package:image/image.dart' as img;
 import 'package:pinenacl/api.dart' as pinenacl;
 import 'package:skynet/src/encode_endian/encode_endian.dart';
 import 'package:skynet/src/encode_endian/base.dart';
+import 'package:skynet/src/crypto.dart';
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
@@ -550,7 +551,8 @@ class FileSystemDAC {
   Future<void> doOperationsOnDirectoryInternal(
     Uri uri,
   ) async {
-    final res = await getJsonEncryptedWithUri(uri);
+    final uriHash = convertUriToHashForCache(uri);
+    final res = await getJsonEncryptedWithUri(uri, uriHash);
 
     final directoryIndex = res.data != null
         ? DirectoryIndex.fromJson(res.data)
@@ -626,11 +628,11 @@ class FileSystemDAC {
     if (uri.path == '/' + DATA_DOMAIN) return;
 
     getDirectoryIndexChangeNotifier(
-      convertUriToHashForCache(uri),
+      uriHash,
     ).updateDirectoryIndex(directoryIndex);
 
     directoryIndexCache.put(
-      convertUriToHashForCache(uri),
+      uriHash,
       CachedEntry(
         revision: res.revision + 1,
         data: json.encode(
@@ -782,7 +784,22 @@ class FileSystemDAC {
       write: false,
     );
 
-    final di = await _getDirectoryIndexInternal(parsedPath);
+    late DirectoryIndex di;
+
+    if (parsedPath.queryParameters.containsKey('recursive')) {
+      final type = parsedPath.queryParameters['type'] ?? '*';
+      di = await getAllFiles(
+        startDirectory: Uri(
+          host: parsedPath.host,
+          path: parsedPath.path,
+          scheme: parsedPath.scheme,
+        ).toString(),
+        includeFiles: type != 'directory',
+        includeDirectories: type != 'file',
+      );
+    } else {
+      di = await _getDirectoryIndexInternal(parsedPath);
+    }
 
     if (parsedPath.queryParameters.isNotEmpty) {
       if (parsedPath.queryParameters.containsKey('q')) {
@@ -883,6 +900,7 @@ class FileSystemDAC {
 
     final res = await getJsonEncryptedWithUri(
       parsedPath,
+      uriHash,
     );
 
     if (directoryIndexCache.containsKey(uriHash)) {
@@ -1857,7 +1875,6 @@ class FileSystemDAC {
         lastDownloadedLengthTS = DateTime.now();
       } else {
         final diff = DateTime.now().difference(lastDownloadedLengthTS);
-        print(diff);
         if (diff > Duration(seconds: 20)) {
           print('detected download issue, reconnecting...');
           lastDownloadedLengthTS = DateTime.now();
@@ -2021,17 +2038,25 @@ class FileSystemDAC {
 
   final Map<String, SkynetUser> skynetUserCache = {};
 
-  Future<DataWithRevision<dynamic>> getJsonEncryptedWithUri(Uri uri) async {
+  Future<DataWithRevision<dynamic>> getJsonEncryptedWithUri(
+    Uri uri,
+    String uriHash,
+  ) async {
     log('getJsonEncryptedWithUri $uri');
+
+    late String userId;
+    late String pathSeed;
+
     if (uri.host == 'local') {
-      log('uriPathToMySkyPath result ${uriPathToMySkyPath(uri.pathSegments)}');
-      return mySkyProvider.getJSONEncrypted(
+      userId = await mySkyProvider.userId();
+      pathSeed = await mySkyProvider.getEncryptedFileSeed(
         uriPathToMySkyPath(uri.pathSegments),
+        false,
       );
     } else {
       final userInfo = uri.userInfo;
       if (userInfo.startsWith('r:')) {
-        final userId = uri.host;
+        userId = uri.host;
         final rootPathSeed = hex.encode(
           base64Url.decode(
             userInfo.substring(2),
@@ -2043,36 +2068,56 @@ class FileSystemDAC {
         log('rootPathSeed $rootPathSeed');
         log('path $path');
 
-        final childPathSeed = deriveEncryptedPathSeed(
+        pathSeed = deriveEncryptedPathSeed(
           rootPathSeed,
           path,
           false,
         );
-        log('childPathSeed $childPathSeed');
-
-        return mySkyProvider.getJSONEncrypted(
-          '',
-          userID: userId,
-          pathSeed: childPathSeed,
-        );
       } else if (userInfo.startsWith('rw:')) {
         final skynetUser = await _getSkynetUser(userInfo);
+        userId = skynetUser.id;
+
         final path = [...uri.pathSegments, 'index.json'].join('/');
 
-        final pathSeed = await mysky_io_impl.getEncryptedPathSeed(
+        pathSeed = await mysky_io_impl.getEncryptedPathSeed(
           path,
           false,
           skynetUser.rawSeed,
         );
-
-        return mysky_io_impl.getJSONEncrypted(
-          skynetUser.id,
-          pathSeed,
-          skynetClient: client,
-        );
       } else {
         throw 'Invalid URI';
       }
+    }
+
+    final dataKey = deriveEncryptedFileTweak(pathSeed);
+    final encryptionKey = deriveEncryptedFileKeyEntropy(pathSeed);
+
+    final res = await mySkyProvider.client.registry.getEntry(
+      SkynetUser.fromId(userId),
+      '',
+      timeoutInSeconds: 10,
+      hashedDatakey: dataKey,
+    );
+    if (res == null) {
+      return DataWithRevision(null, -1);
+    }
+    final cached = directoryIndexCache.get(uriHash);
+
+    if (res.entry.revision > (cached?.revision ?? -1)) {
+      final skylink = decodeSkylinkFromRegistryEntry(res.entry.data);
+      final contentRes = await mySkyProvider.client.httpClient.get(
+        Uri.https(mySkyProvider.client.portalHost, '$skylink'),
+        headers: mySkyProvider.client.headers,
+      );
+
+      final data = decryptJSONFile(contentRes.bodyBytes, encryptionKey);
+
+      if (data.containsKey('_data')) {
+        return DataWithRevision(data['_data'], res.entry.revision);
+      }
+      return DataWithRevision(data, res.entry.revision);
+    } else {
+      return DataWithRevision(json.decode(cached!.data), cached.revision);
     }
   }
 
