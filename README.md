@@ -1,8 +1,8 @@
-# File System DAC
+# SkyFS
 
-The File System DAC manages a virtual encrypted file system structure and exposes methods to manipulate it to Skynet apps.
+SkyFS manages a virtual encrypted file system structure and exposes methods to manipulate it to Skynet apps.
 
-This DAC uses the https://github.com/SkynetLabs/skystandards data structures.
+It uses the https://github.com/SkynetLabs/skystandards data structures.
 
 ## Features
 
@@ -16,4 +16,4 @@ This DAC uses the https://github.com/SkynetLabs/skystandards data structures.
 
 ## TypeScript library
 
-[Link to install instructions and docs](https://github.com/redsolver/filesystem-dac/tree/main/library-ts)
+[Link to install instructions and docs](https://github.com/redsolver/skyfs/tree/main/library-ts)
