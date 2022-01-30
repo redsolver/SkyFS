@@ -2285,6 +2285,7 @@ class FileSystemDAC {
 
   Future<Map<String, String>> aggregateAllSkylinks({
     String startDirectory = '',
+    required int registryFetchDelay,
   }) async {
     if (!rootAccessEnabled) {
       throw 'Permission denied';
@@ -2294,6 +2295,7 @@ class FileSystemDAC {
     collectedSkylinks = [];
     final result = <String, String>{};
     Future<void> processDirectory(String path) async {
+      await Future.delayed(Duration(milliseconds: registryFetchDelay));
       final dir =
           /* getDirectoryIndexCached(path) ??  */ await getDirectoryIndex(path);
 
@@ -2330,7 +2332,7 @@ class FileSystemDAC {
             final pathSeed = hex.encode(keyInBytes);
 
             final dataKey = deriveEncryptedFileTweak(pathSeed);
-
+            await Future.delayed(Duration(milliseconds: registryFetchDelay));
             // lookup the registry entry
             final res = await client.registry.getEntry(
               SkynetUser.fromId(parts[0]),
