@@ -1696,7 +1696,7 @@ class FileSystemDAC {
     final existing = await loadThumbnail(key);
     if (existing == null) {
       uploadingThumbnailKeys.add(key);
-      await thumbnailCache.put(key, bytes);
+      await thumbnailCache.put(key.replaceFirst('/', '-'), bytes);
       final parts = key.split('/');
 
       final keyInBytes = base64Url.decode(parts[1]);
@@ -1725,8 +1725,8 @@ class FileSystemDAC {
 
   // TODO Optimization: only 1 concurrent instance / key
   Future<Uint8List?> loadThumbnail(String key) async {
-    if (await thumbnailCache.containsKey(key)) {
-      return thumbnailCache.get(key);
+    if (await thumbnailCache.containsKey(key.replaceFirst('/', '-'))) {
+      return thumbnailCache.get(key.replaceFirst('/', '-'));
     }
     if (thumbnailCompleters.containsKey(key)) {
       return thumbnailCompleters[key]!.future;
@@ -1753,7 +1753,7 @@ class FileSystemDAC {
     }
 
     final data = res.data!;
-    await thumbnailCache.put(key, data);
+    await thumbnailCache.put(key.replaceFirst('/', '-'), data);
 
     completer.complete(data);
 
