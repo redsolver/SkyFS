@@ -570,6 +570,8 @@ class FileSystemDAC {
 
     bool doUpdate = false;
 
+    log('[dirIndex] process ${tasks.length} tasks');
+
     for (final task in tasks) {
       try {
         final res = await task.operation(directoryIndex);
