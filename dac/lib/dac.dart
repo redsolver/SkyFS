@@ -22,7 +22,7 @@ import 'package:skynet/src/skystandards/fs.dart';
 import 'package:skynet/src/mysky/encrypted_files.dart';
 import 'package:http/http.dart' as http;
 import 'package:skynet/src/mysky/io.dart' as mysky_io_impl;
-import 'package:mime/mime.dart';
+import 'package:mime_type/mime_type.dart';
 import 'package:sodium/sodium.dart' hide Box;
 import 'package:state_notifier/state_notifier.dart';
 import 'package:image/image.dart' as img;
@@ -30,6 +30,8 @@ import 'package:pinenacl/api.dart' as pinenacl;
 import 'package:skynet/src/encode_endian/encode_endian.dart';
 import 'package:skynet/src/encode_endian/base.dart';
 import 'package:skynet/src/crypto.dart';
+import 'package:uuid/uuid.dart';
+import 'package:stash/stash_api.dart';
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
@@ -144,6 +146,12 @@ Future<List> extractMetadata(List list) async {
           bytes = pictureBytes;
           hasThumbnail = true;
         }
+        if (tags.containsKey('Genre')) {
+          if (tags['Genre'].startsWith('(')) {
+            ext['mp3']['Genre'] =
+                tags['Genre'].substring(tags['Genre'].indexOf(')') + 1);
+          }
+        }
       }
     } catch (e, st) {
       print(e);
@@ -191,6 +199,8 @@ Future<List> extractMetadata(List list) async {
       'Album': 'album',
       'Track': 'track',
       'Year': 'date',
+      'Genre': 'genre',
+      'ISRC': 'isrc',
       // 'cover': 'cover',
     };
     ext!['audio'] ??= {};
@@ -213,7 +223,9 @@ Future<List> extractMetadata(List list) async {
       'ALBUM': 'album',
       'TRACKNUMBER': 'track',
       'DATE': 'date',
+      'GENRE': 'genre',
       'COMMENT': 'comment',
+      'ISRC': 'isrc',
       // 'cover': 'cover',
     };
     ext!['audio'] ??= {};
@@ -222,6 +234,9 @@ Future<List> extractMetadata(List list) async {
         ext['audio'][map[key]] = ext['flac'][key];
       }
     }
+  }
+  if (ext?['audio']?['isrc'] != null) {
+    ext!['audio']['isrc'] = ext['audio']['isrc'].trim();
   }
   // TODO audio length on web (use ffmpeg)
 
@@ -319,7 +334,8 @@ class FileSystemDAC {
   late final bool rootAccessEnabled;
 
   late final Box<CachedEntry> directoryIndexCache;
-  late final Box<Uint8List> thumbnailCache;
+  // late final LazyBox<Uint8List> thumbnailCache;
+  late final Cache<Uint8List> thumbnailCache;
 
   final _fileStateChangeNotifiers = <String, FileStateNotifier>{};
   final _directoryIndexChangeNotifiers =
@@ -334,7 +350,9 @@ class FileSystemDAC {
     required this.mySkyProvider,
     required this.skapp,
     required this.sodium,
+    this.onLog,
     this.debugEnabled = false,
+    required this.thumbnailCache,
   });
 
   FileStateNotifier getFileStateChangeNotifier(String hash) {
@@ -392,9 +410,10 @@ class FileSystemDAC {
     directoryIndexCache = await Hive.openBox<CachedEntry>(
       'fs-dac-directory-index-cache',
     );
-    thumbnailCache = await Hive.openBox<Uint8List>(
-      'fs-dac-thumbnail-cache',
-    );
+
+    if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
+      Hive.deleteBoxFromDisk('fs-dac-thumbnail-cache');
+    }
   }
 
   Future<void> onUserLogin() async {
@@ -560,6 +579,9 @@ class FileSystemDAC {
             directories: {},
             files: {},
           );
+    if (!UniversalPlatform.isWeb) {
+      populateUris(uri, directoryIndex);
+    }
 
     final tasks = <DirectoryOperationTask>[];
 
@@ -682,18 +704,20 @@ class FileSystemDAC {
       final dir =
           getDirectoryIndexCached(path) ?? await getDirectoryIndex(path);
 
+      // print('processDirectory $path ${dir.files.keys.length}');
+
       for (final subDir in dir.directories.keys) {
         if (subDir.isNotEmpty) {
-          await processDirectory('$path/$subDir');
+          final childUri = getChildUri(parsePath(path), subDir);
+          await processDirectory(childUri.toString());
           if (includeDirectories) {
-            result.directories[parsePath('$path/$subDir').toString()] =
-                dir.directories[subDir]!;
+            result.directories[childUri.toString()] = dir.directories[subDir]!;
           }
         }
       }
       if (includeFiles) {
         for (final key in dir.files.keys) {
-          final uri = parsePath('$path/$key');
+          final uri = getChildUri(parsePath(path), key);
           result.files[uri.toString()] = dir.files[key]!;
         }
       }
@@ -772,7 +796,29 @@ class FileSystemDAC {
         index = DirectoryIndex(directories: {}, files: {});
       }
 
+      if (!UniversalPlatform.isWeb) {
+        populateUris(uri, index);
+      }
+
       return index;
+    }
+  }
+
+  void populateUris(Uri currentUri, DirectoryIndex di) {
+    for (final key in di.files.keys) {
+      di.files[key]!.key = key;
+
+      di.files[key]!.uri = key.startsWith('skyfs://')
+          ? key
+          : getChildUri(currentUri, key).toString();
+    }
+
+    for (final key in di.directories.keys) {
+      di.directories[key]!.key = key;
+
+      di.directories[key]!.uri = key.startsWith('skyfs://')
+          ? key
+          : getChildUri(currentUri, key).toString();
     }
   }
 
@@ -863,13 +909,7 @@ class FileSystemDAC {
     }
 
     if (!UniversalPlatform.isWeb) {
-      for (final key in di.files.keys) {
-        di.files[key]!.uri = key;
-      }
-
-      for (final key in di.directories.keys) {
-        di.directories[key]!.uri = key;
-      }
+      populateUris(parsedPath, di);
     }
 
     return di;
@@ -979,7 +1019,7 @@ class FileSystemDAC {
       uri,
       (directoryIndex) async {
         if (directoryIndex.directories.containsKey(name))
-          throw 'Directory already contains a folder with the same name';
+          throw 'Directory already contains a subdirectory with the same name';
 
         directoryIndex.directories[name] = DirectoryDirectory(
           created: nowTimestamp(),
@@ -991,7 +1031,6 @@ class FileSystemDAC {
     return res;
   }
 
-  // TODO This is not recursive (yet)!
   Future<DirectoryOperationTaskResult> deleteDirectory(
     String path,
     String name,
@@ -1036,6 +1075,48 @@ class FileSystemDAC {
     );
 
     return res2;
+  }
+
+  Future<DirectoryOperationTaskResult> deleteDirectoryRecursive(
+    String path,
+  ) async {
+    final uri = parsePath(path);
+
+    validateAccess(
+      uri,
+      read: true,
+      write: true,
+    );
+
+    log('deleteDirectoryRecursive $uri [skapp: $skapp]');
+
+    final res = await doOperationOnDirectory(
+      uri,
+      (directoryIndex) async {
+        for (final name in directoryIndex.directories.keys) {
+          final res =
+              await deleteDirectoryRecursive(getChildUri(uri, name).toString());
+          if (!res.success) {
+            throw res.error!;
+          }
+        }
+        directoryIndex.directories = {};
+        directoryIndex.files = {};
+      },
+    );
+    return res;
+
+    /*   
+
+    final res2 = await doOperationOnDirectory(
+      uri,
+      (directoryIndex) async {
+        directoryIndex.directories.remove(name);
+      },
+    );
+
+    return res2; */
+    return DirectoryOperationTaskResult(true);
   }
 
   Future<SkynetUser> _getSkynetUser(String userInfo) async {
@@ -1120,7 +1201,7 @@ class FileSystemDAC {
           created: fileData.ts,
           modified: fileData.ts,
           name: name,
-          mimeType: lookupMimeType(name),
+          mimeType: mimeFromExtension(name.split('.').last),
           version: 0,
           history: {},
           file: fileData,
@@ -1128,7 +1209,7 @@ class FileSystemDAC {
         );
         file.file.ext = null;
         directoryIndex.files[name] = file;
-        submitFileToIndexer(directoryPath, file);
+        // submitFileToIndexer(directoryPath, file);
       },
     );
     return res;
@@ -1141,6 +1222,12 @@ class FileSystemDAC {
       return FilePathParseResponse(
         '',
         filePath,
+      );
+    }
+    if (filePath.startsWith('skyfs://')) {
+      return FilePathParseResponse(
+        filePath.substring(0, filePath.length - fileName.length - 1),
+        Uri.decodeFull(fileName),
       );
     }
 
@@ -1190,8 +1277,9 @@ class FileSystemDAC {
 
   Future<DirectoryOperationTaskResult> moveFile(
     String sourceFilePath,
-    String targetFilePath,
-  ) async {
+    String targetFilePath, {
+    bool generateRandomKey = false,
+  }) async {
     final source = parseFilePath(sourceFilePath);
     final target = parseFilePath(targetFilePath);
 
@@ -1223,13 +1311,17 @@ class FileSystemDAC {
         final res = await doOperationOnDirectory(
           targetDirectory,
           (targetDirIndex) async {
-            if (targetDirIndex.files.containsKey(target.fileName))
-              throw 'Target directory already contains a file with the same name';
+            if (!generateRandomKey) {
+              if (targetDirIndex.files.containsKey(target.fileName))
+                throw 'Target directory already contains a file with the same name';
+            }
 
-            targetDirIndex.files[target.fileName] =
+            final targetKey = generateRandomKey ? Uuid().v4() : target.fileName;
+
+            targetDirIndex.files[targetKey] =
                 sourceDirIndex.files[source.fileName]!;
 
-            targetDirIndex.files[target.fileName]!.name = target.fileName;
+            targetDirIndex.files[targetKey]!.name = target.fileName;
           },
         );
         if (res.success != true) throw res.error!;
@@ -1353,11 +1445,64 @@ class FileSystemDAC {
     if (recursive) {
       for (final subDir in sourceDir.directories.keys) {
         await cloneDirectory(
-          sourceDirectoryPath + '/$subDir',
-          targetDirectoryPath + '/$subDir',
+          getChildUri(sourceDirectory, subDir).toString(),
+          getChildUri(targetDirectory, subDir).toString(),
         );
       }
     }
+  }
+
+  Uri getChildUri(Uri uri, String name) {
+    return uri.replace(
+      pathSegments: uri.pathSegments + [name],
+      queryParameters: null,
+    );
+  }
+
+  Future<DirectoryOperationTaskResult> moveDirectory(
+    String sourceDirectoryPath,
+    String targetDirectoryPath,
+  ) async {
+    final sourceDirectory = parsePath(sourceDirectoryPath);
+    final targetDirectory = parsePath(targetDirectoryPath);
+
+    validateAccess(
+      sourceDirectory,
+      read: true,
+      write: true,
+    );
+
+    validateAccess(
+      targetDirectory,
+      read: true,
+      write: true,
+    );
+
+    log('moveDirectory $sourceDirectory to $targetDirectory [skapp: $skapp]');
+
+    final oldPath = parseFilePath(sourceDirectoryPath);
+    final newPath = parseFilePath(targetDirectoryPath);
+
+    validateFileSystemEntityName(newPath.fileName);
+
+    final di = await getDirectoryIndex(newPath.directoryPath);
+
+    if (di.directories.containsKey(newPath.fileName)) {
+      throw 'Target directory already contains a subdirectory with that name.';
+    }
+
+    await cloneDirectory(sourceDirectoryPath, targetDirectoryPath);
+
+    await createDirectory(newPath.directoryPath, newPath.fileName);
+
+    final res = await deleteDirectoryRecursive(sourceDirectoryPath);
+
+    if (!res.success) return res;
+
+    return await doOperationOnDirectory(parsePath(oldPath.directoryPath),
+        (directoryIndex) async {
+      directoryIndex.directories.remove(oldPath.fileName);
+    });
   }
 
   bool isIndexPath(String path) {
@@ -1403,7 +1548,7 @@ class FileSystemDAC {
 
         directoryIndex.files[name] = df;
 
-        submitFileToIndexer(directoryPath, df);
+        // submitFileToIndexer(directoryPath, df);
       },
     );
 
@@ -1541,17 +1686,23 @@ class FileSystemDAC {
 
   final uploadThumbnailPool = Pool(2);
 
+  Set<String> uploadingThumbnailKeys = <String>{};
+
   // TODO Use pool to prevent too many concurrent uploads
   Future<void> uploadThumbnail(String key, Uint8List bytes) async {
+    if (uploadingThumbnailKeys.contains(key)) {
+      return;
+    }
     final existing = await loadThumbnail(key);
     if (existing == null) {
-      thumbnailCache.put(key, bytes);
+      uploadingThumbnailKeys.add(key);
+      await thumbnailCache.put(key, bytes);
       final parts = key.split('/');
 
       final keyInBytes = base64Url.decode(parts[1]);
 
       await uploadThumbnailPool.withResource(() async {
-        log('uploading thumbnail');
+        log('uploading thumbnail $key');
         final r = RetryOptions(maxAttempts: 12);
         await r.retry(
           () => mySkyProvider.setRawDataEncrypted(
@@ -1574,7 +1725,7 @@ class FileSystemDAC {
 
   // TODO Optimization: only 1 concurrent instance / key
   Future<Uint8List?> loadThumbnail(String key) async {
-    if (thumbnailCache.containsKey(key)) {
+    if (await thumbnailCache.containsKey(key)) {
       return thumbnailCache.get(key);
     }
     if (thumbnailCompleters.containsKey(key)) {
@@ -1602,7 +1753,7 @@ class FileSystemDAC {
     }
 
     final data = res.data!;
-    thumbnailCache.put(key, data);
+    await thumbnailCache.put(key, data);
 
     completer.complete(data);
 
@@ -2103,6 +2254,12 @@ class FileSystemDAC {
     if (res == null) {
       return DataWithRevision(null, -1);
     }
+
+    if (collectSkylinks) {
+      final skylink = decodeSkylinkFromRegistryEntry(res.entry.data);
+      collectedSkylinks.add(skylink);
+    }
+
     final cached = directoryIndexCache.get(uriHash);
 
     if (res.entry.revision > (cached?.revision ?? -1)) {
@@ -2123,11 +2280,93 @@ class FileSystemDAC {
     }
   }
 
+  bool collectSkylinks = false;
+  List<String> collectedSkylinks = [];
+
+  Future<Map<String, String>> aggregateAllSkylinks({
+    String startDirectory = '',
+  }) async {
+    if (!rootAccessEnabled) {
+      throw 'Permission denied';
+    }
+
+    collectSkylinks = true;
+    collectedSkylinks = [];
+    final result = <String, String>{};
+    Future<void> processDirectory(String path) async {
+      final dir =
+          /* getDirectoryIndexCached(path) ??  */ await getDirectoryIndex(path);
+
+      if (dir.directories.isEmpty && dir.files.isEmpty) {
+        return;
+      }
+
+      for (final subDir in dir.directories.keys) {
+        if (subDir.isNotEmpty) {
+          await processDirectory('$path/$subDir'); // TODO[]
+
+        }
+      }
+
+      for (final key in dir.files.keys) {
+        // final uri = parsePath('$path/$key');
+        final file = dir.files[key]!;
+        for (final version in [
+          file.file,
+          ...(file.history?.values ?? <FileData>[])
+        ]) {
+          result[version.url.substring(6)] = 'File Content';
+          // coverKey
+        }
+        for (final key in [
+          file.ext?['audio']?['coverKey'],
+          file.ext?['video']?['coverKey'],
+          file.ext?['thumbnail']?['key'],
+        ]) {
+          if (key != null) {
+            final parts = key.split('/');
+            if (parts.length != 2) continue;
+            final keyInBytes = base64Url.decode(parts[1]);
+            final pathSeed = hex.encode(keyInBytes);
+
+            final dataKey = deriveEncryptedFileTweak(pathSeed);
+
+            // lookup the registry entry
+            final res = await client.registry.getEntry(
+              SkynetUser.fromId(parts[0]),
+              '',
+              timeoutInSeconds: 10,
+              hashedDatakey: dataKey,
+            );
+            if (res == null) continue;
+            final skylink = decodeSkylinkFromRegistryEntry(res.entry.data);
+            result[skylink] = 'Thumbnail/Cover';
+          }
+        }
+      }
+    }
+
+    await processDirectory(startDirectory);
+
+    collectSkylinks = false;
+    for (final s in collectedSkylinks) {
+      result[s] = 'DirectoryIndex';
+    }
+
+    return result;
+  }
+
+  Function? onLog;
+
   void log(
     String message,
   ) {
-    if (debugEnabled) {
-      print('[FileSystemDAC] $message');
+    if (onLog != null) {
+      onLog!(message);
+    } else {
+      if (debugEnabled) {
+        print('[SkyFS] $message');
+      }
     }
   }
 }
