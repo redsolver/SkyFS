@@ -13,4 +13,6 @@ class CachedEntry {
     required this.revision,
     required this.data,
   });
+
+  Map<String, dynamic> toJson() => {'r': revision, 'd': data};
 }

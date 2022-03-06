@@ -87,6 +87,9 @@ const supportedVideoExtensionsForFFmpeg = [
   '.mkv',
   '.mp4',
   '.webm',
+  '.mov',
+  '.avi',
+  '.wmv',
 ];
 
 const metadataSupportedExtensions = [
@@ -334,6 +337,7 @@ class FileSystemDAC {
   late final bool rootAccessEnabled;
 
   late final Box<CachedEntry> directoryIndexCache;
+  late final Box<String> deletedSkylinks;
   // late final LazyBox<Uint8List> thumbnailCache;
   late final Cache<Uint8List> thumbnailCache;
 
@@ -409,6 +413,10 @@ class FileSystemDAC {
     Hive.registerAdapter(CachedEntryAdapter());
     directoryIndexCache = await Hive.openBox<CachedEntry>(
       'fs-dac-directory-index-cache',
+    );
+
+    deletedSkylinks = await Hive.openBox<String>(
+      'skyfs-deleted-skylinks',
     );
 
     if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
@@ -525,7 +533,7 @@ class FileSystemDAC {
   }
 
   void setFileState(String hash, FileState state) {
-    log('setFileState $hash $state');
+    // log('setFileState $hash $state');
     // runningTasks
     getFileStateChangeNotifier(hash).updateFileState(state);
   }
@@ -808,7 +816,7 @@ class FileSystemDAC {
     for (final key in di.files.keys) {
       di.files[key]!.key = key;
 
-      di.files[key]!.uri = key.startsWith('skyfs://')
+      di.files[key]!.uri ??= key.startsWith('skyfs://')
           ? key
           : getChildUri(currentUri, key).toString();
     }
@@ -816,7 +824,7 @@ class FileSystemDAC {
     for (final key in di.directories.keys) {
       di.directories[key]!.key = key;
 
-      di.directories[key]!.uri = key.startsWith('skyfs://')
+      di.directories[key]!.uri ??= key.startsWith('skyfs://')
           ? key
           : getChildUri(currentUri, key).toString();
     }
@@ -1101,6 +1109,9 @@ class FileSystemDAC {
           }
         }
         directoryIndex.directories = {};
+        for (final file in directoryIndex.files.values) {
+          deleteFileSkylinks(file);
+        }
         directoryIndex.files = {};
       },
     );
@@ -1117,6 +1128,25 @@ class FileSystemDAC {
 
     return res2; */
     return DirectoryOperationTaskResult(true);
+  }
+
+  void deleteFileSkylinks(DirectoryFile file) {
+    for (final url in [
+      file.file.url,
+      ...(file.history?.values.map((e) => e.url).toList() ?? [])
+    ]) {
+      deletedSkylinks.add(url);
+    }
+
+    for (final key in [
+      file.ext?['audio']?['coverKey'],
+      file.ext?['video']?['coverKey'],
+      file.ext?['thumbnail']?['key'],
+    ]) {
+      if (key != null) {
+        deletedSkylinks.add(key);
+      }
+    }
   }
 
   Future<SkynetUser> _getSkynetUser(String userInfo) async {
@@ -1175,10 +1205,8 @@ class FileSystemDAC {
   }
 
   Future<DirectoryOperationTaskResult> createFile(
-    String directoryPath,
-    String name,
-    FileData fileData,
-  ) async {
+      String directoryPath, String name, FileData fileData,
+      {String? customMimeType}) async {
     final path = parsePath(directoryPath);
 
     validateAccess(
@@ -1201,7 +1229,7 @@ class FileSystemDAC {
           created: fileData.ts,
           modified: fileData.ts,
           name: name,
-          mimeType: mimeFromExtension(name.split('.').last),
+          mimeType: customMimeType ?? mimeFromExtension(name.split('.').last),
           version: 0,
           history: {},
           file: fileData,
@@ -1400,6 +1428,7 @@ class FileSystemDAC {
           print(e);
           print(st);
         } */
+        deleteFileSkylinks(directoryIndex.files[file.fileName]!);
 
         directoryIndex.files.remove(file.fileName);
       },
@@ -1555,6 +1584,33 @@ class FileSystemDAC {
     return res;
   }
 
+  Future<DirectoryOperationTaskResult> updateFileExtensionData(
+    String uri,
+    Map<String, dynamic>? newExtData,
+  ) async {
+    final f = parseFilePath(uri);
+
+    final directoryUri = parsePath(f.directoryPath);
+
+    validateAccess(
+      directoryUri,
+      read: true,
+      write: true,
+    );
+
+    final res = await doOperationOnDirectory(
+      directoryUri,
+      (directoryIndex) async {
+        if (!directoryIndex.files.containsKey(f.fileName))
+          throw 'Directory does not contain a file with this name, so it can\'t be updated';
+
+        directoryIndex.files[f.fileName]!.ext = newExtData;
+      },
+    );
+
+    return res;
+  }
+
   final _indexedExtKeys = [
     'video',
     'audio',
@@ -1612,6 +1668,7 @@ class FileSystemDAC {
     Function? generateMetadataWrapper,
     Map<String, dynamic> additionalExt = const {},
     List<String>? hashes,
+    bool metadataOnly = false,
   }) async {
     Map<String, dynamic>? ext;
 
@@ -1628,7 +1685,7 @@ class FileSystemDAC {
 
       int index = 1;
 
-      for (final type in ['audio', 'video']) {
+/*       for (final type in ['audio', 'video']) {
         if ((ext?[type] ?? {})?['coverKey'] != null) {
           ext![type]['coverKey'] =
               (await mySkyProvider.userId()) + '/' + ext[type]['coverKey'];
@@ -1637,7 +1694,7 @@ class FileSystemDAC {
 
           index++;
         }
-      }
+      } */
 
       if (ext?.containsKey('thumbnail') ?? false) {
         ext!['thumbnail']['key'] =
@@ -1652,6 +1709,19 @@ class FileSystemDAC {
       for (final k in additionalExt[key].keys) {
         ext[key][k] = additionalExt[key][k];
       }
+    }
+
+    if (metadataOnly) {
+      return FileData(
+        chunkSize: maxChunkSize,
+        encryptionType: 'none',
+        url: '',
+        key: '',
+        hash: multihash,
+        size: size,
+        ts: nowTimestamp(),
+        ext: ext,
+      );
     }
 
     EncryptAndUploadResponse res;
@@ -1673,7 +1743,7 @@ class FileSystemDAC {
       chunkSize: res.maxChunkSize,
       encryptionType: res.encryptionType,
       padding: res.padding,
-      url: 'sia://${res.skylink}',
+      url: res.blobUrl,
       key: base64Url.encode(res.secretKey),
       hash: multihash,
       hashes: hashes,
@@ -1693,10 +1763,11 @@ class FileSystemDAC {
     if (uploadingThumbnailKeys.contains(key)) {
       return;
     }
-    final existing = await loadThumbnail(key);
-    if (existing == null) {
+    // final existing = await loadThumbnail(key);
+    if (!(await thumbnailCache
+        .containsKey(key /* .replaceFirst('/', '-') */))) {
       uploadingThumbnailKeys.add(key);
-      await thumbnailCache.put(key.replaceFirst('/', '-'), bytes);
+      await thumbnailCache.put(key /* .replaceFirst('/', '-') */, bytes);
       final parts = key.split('/');
 
       final keyInBytes = base64Url.decode(parts[1]);
@@ -1725,8 +1796,8 @@ class FileSystemDAC {
 
   // TODO Optimization: only 1 concurrent instance / key
   Future<Uint8List?> loadThumbnail(String key) async {
-    if (await thumbnailCache.containsKey(key.replaceFirst('/', '-'))) {
-      return thumbnailCache.get(key.replaceFirst('/', '-'));
+    if (await thumbnailCache.containsKey(key /* .replaceFirst('/', '-') */)) {
+      return thumbnailCache.get(key /* .replaceFirst('/', '-') */);
     }
     if (thumbnailCompleters.containsKey(key)) {
       return thumbnailCompleters[key]!.future;
@@ -1753,7 +1824,7 @@ class FileSystemDAC {
     }
 
     final data = res.data!;
-    await thumbnailCache.put(key.replaceFirst('/', '-'), data);
+    await thumbnailCache.put(key /* .replaceFirst('/', '-') */, data);
 
     completer.complete(data);
 
@@ -1925,6 +1996,8 @@ class FileSystemDAC {
         completer.complete(true);
       },
       onError: (e) {
+        progressSub?.cancel();
+        streamCtrl.close();
         // TODO Handle error
       },
       cancelOnError: true,
@@ -2112,6 +2185,8 @@ class FileSystemDAC {
         completer.complete(true);
       },
       onError: (e) {
+        progressSub?.cancel();
+        streamCtrl.close();
         // TODO Handle error
       },
       cancelOnError: true,
@@ -2294,10 +2369,11 @@ class FileSystemDAC {
     collectSkylinks = true;
     collectedSkylinks = [];
     final result = <String, String>{};
-    Future<void> processDirectory(String path) async {
+    Future<void> processDirectory(Uri uri) async {
       await Future.delayed(Duration(milliseconds: registryFetchDelay));
       final dir =
-          /* getDirectoryIndexCached(path) ??  */ await getDirectoryIndex(path);
+          /* getDirectoryIndexCached(path) ??  */ await getDirectoryIndex(
+              uri.toString());
 
       if (dir.directories.isEmpty && dir.files.isEmpty) {
         return;
@@ -2305,8 +2381,7 @@ class FileSystemDAC {
 
       for (final subDir in dir.directories.keys) {
         if (subDir.isNotEmpty) {
-          await processDirectory('$path/$subDir'); // TODO[]
-
+          await processDirectory(getChildUri(uri, subDir));
         }
       }
 
@@ -2348,7 +2423,7 @@ class FileSystemDAC {
       }
     }
 
-    await processDirectory(startDirectory);
+    await processDirectory(parsePath(startDirectory));
 
     collectSkylinks = false;
     for (final s in collectedSkylinks) {
@@ -2414,14 +2489,14 @@ class UploadingFilesChangeNotifier
 }
 
 class EncryptAndUploadResponse {
-  final String skylink;
+  final String blobUrl;
   final Uint8List secretKey;
   final String encryptionType;
   final int maxChunkSize;
   final int padding;
   // final Uint8List nonce;
   EncryptAndUploadResponse({
-    required this.skylink,
+    required this.blobUrl,
     required this.secretKey,
     required this.encryptionType,
     required this.maxChunkSize,
