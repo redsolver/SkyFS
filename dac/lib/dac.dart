@@ -425,7 +425,9 @@ class FileSystemDAC {
   }
 
   Future<void> onUserLogin() async {
-    print('onUserLogin');
+    log('onUserLogin');
+
+    loadMounts();
 
     log('createRootDirectory $skapp [skapp: $skapp]');
 
@@ -494,29 +496,113 @@ class FileSystemDAC {
     return uri;
   }
 
-  final mounts = <String, dynamic>{};
+  final _mountsPath = 'fs-dac.hns/fs-dac.hns/mounts.json';
 
-  Future<void> mountUri(String path, Uri uri) async {
-    final localUri =
-        resolvePath(path); // TODO Check if already mounted (recursive)
+  late DataWithRevision<dynamic> _lastMountsResponse;
+
+  var mounts = <String, Map>{};
+
+  Future<void> loadMounts() async {
+    log('> loadMounts');
+    try {
+      _lastMountsResponse = await mySkyProvider.getJSONEncrypted(
+        _mountsPath,
+      );
+      mounts = (_lastMountsResponse.data ?? {}).cast<String, Map>();
+      // ignore: unawaited_futures
+      directoryIndexCache.put(
+        _mountsPath,
+        CachedEntry(
+            revision: _lastMountsResponse.revision, data: json.encode(mounts)),
+      );
+    } catch (e, st) {
+      log('[loadMounts] $e $st');
+      final cached = directoryIndexCache.get(_mountsPath);
+      if (cached != null) {
+        mounts = json.decode(cached.data).cast<String, Map>();
+      }
+    }
+    log('< loadMounts');
+  }
+
+  Future<void> saveMounts() async {
+    log('> saveMounts');
+    final res = await mySkyProvider.setJSONEncrypted(
+      _mountsPath,
+      mounts,
+      _lastMountsResponse.revision + 1,
+    );
+    if (res != true) throw 'saveMounts failed';
+
+    // ignore: unawaited_futures
+    directoryIndexCache.put(
+      _mountsPath,
+      CachedEntry(
+          revision: _lastMountsResponse.revision, data: json.encode(mounts)),
+    );
+    log('< saveMounts');
+  }
+
+  Future<void> mountUri(
+    String path,
+    Uri uri, {
+    Map<String, dynamic> extMap = const {},
+  }) async {
+    final localUri = resolvePath(path);
     validateAccess(
       localUri,
       read: true,
       write: true,
     );
+    final localUriStr = localUri.toString();
+    for (final mountPoint in mounts.keys) {
+      if (mountPoint.startsWith(localUriStr)) {
+        throw 'There is already a higher mount point at $mountPoint';
+      }
+
+      if (localUriStr.startsWith(mountPoint)) {
+        throw 'There is already a deeper mount point at $mountPoint';
+      }
+    }
     validateAccess(
       uri,
       read: true,
       write: false,
     );
-    // log('mountUri $localUri $uri');
-    if (mounts.containsKey(localUri.toString()))
+    log('mountUri $localUri $uri');
+    await loadMounts();
+
+    if (mounts.containsKey(localUriStr))
       throw 'This path is already used as a mount point';
 
-    mounts[localUri.toString()] = {
+    mounts[localUriStr] = {
       'uri': uri.toString(),
+      'created': DateTime.now().millisecondsSinceEpoch,
+      'ext': extMap,
     };
     log('mounts $mounts');
+
+    await saveMounts();
+  }
+
+  Future<void> unmountUri(String path) async {
+    final localUri = resolvePath(path);
+    log('unmountUri $localUri');
+    validateAccess(
+      localUri,
+      read: true,
+      write: true,
+    );
+
+    await loadMounts();
+
+    if (!mounts.containsKey(localUri.toString()))
+      throw 'This path is not used as a mount point';
+
+    mounts.remove(localUri.toString());
+    log('mounts $mounts');
+
+    await saveMounts();
   }
 
   String getPathHost(String path) {
@@ -781,7 +867,7 @@ class FileSystemDAC {
   }
 
   String convertUriToHashForCache(Uri uri) {
-    return sha256.convert(utf8.encode(uri.toString())).toString();
+    return base64Url.encode(sha1.convert(utf8.encode(uri.toString())).bytes);
   }
 
   Uri resolvePath(String path) {
@@ -2458,6 +2544,20 @@ class FileStateNotifier extends StateNotifier<FileState> {
   void updateFileState(FileState fileState) {
     state = fileState;
   }
+
+/*   final _cancelStream = StreamController<Null>.broadcast();
+
+  Stream<Null> get onCancel => _cancelStream.stream;
+
+  @override
+  void dispose() {
+    _cancelStream.close();
+    super.dispose();
+  }
+
+  void cancel() {
+    _cancelStream.add(null);
+  } */
 }
 
 class DirectoryIndexChangeNotifier extends StateNotifier<DirectoryIndex?> {
