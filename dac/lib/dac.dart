@@ -559,6 +559,10 @@ class FileSystemDAC {
         parsePath(path, resolveMounted: false).toString();
 
     for (final mountPoint in mounts.keys) {
+      if (mountPoint == localNonMountedUriStr) {
+        throw 'There is already a mount point at $mountPoint';
+      }
+
       if (mountPoint.startsWith('$localNonMountedUriStr/')) {
         throw 'There is already a higher mount point at $mountPoint';
       }
