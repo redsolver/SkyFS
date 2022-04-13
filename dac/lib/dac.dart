@@ -554,16 +554,22 @@ class FileSystemDAC {
       read: true,
       write: true,
     );
-    final localUriStr = localUri.toString();
+
+    final localNonMountedUriStr =
+        parsePath(path, resolveMounted: false).toString();
+
     for (final mountPoint in mounts.keys) {
-      if (mountPoint.startsWith(localUriStr)) {
+      if (mountPoint.startsWith('$localNonMountedUriStr/')) {
         throw 'There is already a higher mount point at $mountPoint';
       }
 
-      if (localUriStr.startsWith(mountPoint)) {
+      if (localNonMountedUriStr.startsWith('$mountPoint/')) {
         throw 'There is already a deeper mount point at $mountPoint';
       }
     }
+
+    final localUriStr = localUri.toString();
+
     validateAccess(
       uri,
       read: true,
