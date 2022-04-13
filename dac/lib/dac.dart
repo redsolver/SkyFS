@@ -553,7 +553,7 @@ class FileSystemDAC {
     Uri uri, {
     Map<String, dynamic> extMap = const {},
   }) async {
-    final localUri = resolvePath(path);
+    final localUri = parsePath(path);
     validateAccess(
       localUri,
       read: true,
@@ -601,7 +601,7 @@ class FileSystemDAC {
   }
 
   Future<void> unmountUri(String path) async {
-    final localUri = resolvePath(path);
+    final localUri = parsePath(path, resolveMounted: false);
     log('unmountUri $localUri');
     validateAccess(
       localUri,
@@ -784,7 +784,7 @@ class FileSystemDAC {
     bool read = true,
     bool write = true,
   }) {
-    final uri = resolvePath(path);
+    final uri = parsePath(path);
     try {
       validateAccess(
         uri,
@@ -883,10 +883,6 @@ class FileSystemDAC {
 
   String convertUriToHashForCache(Uri uri) {
     return base64Url.encode(sha1.convert(utf8.encode(uri.toString())).bytes);
-  }
-
-  Uri resolvePath(String path) {
-    return parsePath(path);
   }
 
   DirectoryIndex? getDirectoryIndexCached(String rawPath) {
