@@ -429,6 +429,10 @@ class FileSystemDAC {
 
     loadMounts();
 
+    Stream.periodic(Duration(minutes: 10)).listen((event) {
+      loadMounts();
+    });
+
     log('createRootDirectory $skapp [skapp: $skapp]');
 
     await doOperationOnDirectory(
@@ -478,9 +482,10 @@ class FileSystemDAC {
     }
     // TODO consider additional permission checks for mounted directories
     if (resolveMounted) {
+      final uriStr = uri.toString();
       for (final mount in mounts.keys) {
         final mountUri = mount;
-        if (uri.toString().startsWith(mountUri)) {
+        if (uriStr == mountUri || uriStr.startsWith(mountUri + '/')) {
           validateAccess(
             parsePath(path, resolveMounted: false),
             read: true,
