@@ -4,7 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:blurhash_dart/blurhash_dart.dart';
-import 'package:exif/exif.dart';
+// import 'package:exif/exif.dart';
 import 'package:filesystem_dac/model/utils.dart';
 import 'package:flac_metadata/flac_metadata.dart';
 import 'package:path/path.dart';
@@ -32,10 +32,11 @@ import 'package:skynet/src/encode_endian/base.dart';
 import 'package:skynet/src/crypto.dart';
 import 'package:uuid/uuid.dart';
 import 'package:stash/stash_api.dart';
+import 'package:webdav_client/webdav_client.dart' as webdav;
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
-const maxChunkSize = 1 * 1024 * 1024;
+const maxChunkSize = 1 * 1000 * 1000; // 1 MB
 
 // ! IMPORTANT
 // ! paths allow ALL characters excluding /
@@ -282,7 +283,7 @@ Future<List> extractMetadata(List list) async {
           ).hash,
         };
         more.add(Uint8List.fromList(thumbnailBytes));
-        try {
+        /* try {
           if (!hasThumbnail) {
             Map<String, IfdTag> data = await readExifFromBytes(bytes);
             if (data.isNotEmpty) {
@@ -290,7 +291,7 @@ Future<List> extractMetadata(List list) async {
                   data.map((key, value) => MapEntry(key, value.printable));
             }
           }
-        } catch (e) {}
+        } catch (e) {} */
       }
     } catch (e, st) {
       print(e);
@@ -431,6 +432,12 @@ class FileSystemDAC {
 
     Stream.periodic(Duration(minutes: 10)).listen((event) {
       loadMounts();
+    });
+
+    loadRemotes();
+
+    Stream.periodic(Duration(minutes: 20)).listen((event) {
+      loadRemotes();
     });
 
     log('createRootDirectory $skapp [skapp: $skapp]');
@@ -633,6 +640,57 @@ class FileSystemDAC {
     return localUri.host;
   }
 
+  final _remotesPath = 'fs-dac.hns/fs-dac.hns/remotes.json';
+
+  late DataWithRevision<dynamic> _lastRemotesResponse;
+
+  var customRemotes = <String, Map>{};
+
+  final _webDavClientCache = <String, webdav.Client>{};
+
+  Future<void> loadRemotes() async {
+    log('> loadRemotes');
+    try {
+      _lastRemotesResponse = await mySkyProvider.getJSONEncrypted(
+        _remotesPath,
+      );
+      customRemotes = (_lastRemotesResponse.data ?? {}).cast<String, Map>();
+      // ignore: unawaited_futures
+      directoryIndexCache.put(
+        _remotesPath,
+        CachedEntry(
+            revision: _lastRemotesResponse.revision,
+            data: json.encode(customRemotes)),
+      );
+    } catch (e, st) {
+      log('[loadRemotes] $e $st');
+      final cached = directoryIndexCache.get(_remotesPath);
+      if (cached != null) {
+        customRemotes = json.decode(cached.data).cast<String, Map>();
+      }
+    }
+    log('< loadRemotes');
+  }
+
+  Future<void> saveRemotes() async {
+    log('> saveRemotes');
+    final res = await mySkyProvider.setJSONEncrypted(
+      _remotesPath,
+      customRemotes,
+      _lastRemotesResponse.revision + 1,
+    );
+    if (res != true) throw 'saveRemotes failed';
+
+    // ignore: unawaited_futures
+    directoryIndexCache.put(
+      _remotesPath,
+      CachedEntry(
+          revision: _lastRemotesResponse.revision,
+          data: json.encode(customRemotes)),
+    );
+    log('< saveRemotes');
+  }
+
   void setFileState(String hash, FileState state) {
     // log('setFileState $hash $state');
     // runningTasks
@@ -801,9 +859,14 @@ class FileSystemDAC {
     required bool includeFiles,
     required bool includeDirectories,
   }) async {
-    if (!rootAccessEnabled) {
+    validateAccess(
+      parsePath(startDirectory),
+      read: true,
+      write: false,
+    );
+    /*    if (!rootAccessEnabled) {
       throw 'Permission denied';
-    }
+    } */
 
     final result = DirectoryIndex(
       directories: {},
@@ -866,13 +929,13 @@ class FileSystemDAC {
         throw 'Access denied.';
       }
     } else {
-      if (uri.userInfo.startsWith('r:')) {
+      if (uri.userInfo.startsWith('r:') || uri.host == 'remote') {
         if (write) {
           throw 'Can\'t write to read-only shared directories or files';
         }
       } else if (uri.userInfo.startsWith('rw:')) {
       } else {
-        throw 'URI not supported (you might be using a deprecated format)';
+        throw 'URI not supported (you might be using a deprecated format) $uri';
       }
     }
   }
@@ -946,6 +1009,7 @@ class FileSystemDAC {
           host: parsedPath.host,
           path: parsedPath.path,
           scheme: parsedPath.scheme,
+          userInfo: parsedPath.userInfo,
         ).toString(),
         includeFiles: type != 'directory',
         includeDirectories: type != 'file',
@@ -1021,6 +1085,65 @@ class FileSystemDAC {
   }
 
   Future<DirectoryIndex> _getDirectoryIndexInternal(Uri parsedPath) async {
+    if (parsedPath.host == 'remote') {
+      final remoteId = parsedPath.userInfo.split(':').last;
+      if (!customRemotes.containsKey(remoteId)) {
+        throw 'Remote ${remoteId} not found';
+      }
+      final remote = customRemotes[remoteId]!;
+
+      final Map remoteConfig = remote['config'] as Map;
+
+      if (remote['type'] == 'webdav') {
+        if (!_webDavClientCache.containsKey(remoteId)) {
+          _webDavClientCache[remoteId] = webdav.newClient(
+            remoteConfig['url'] as String,
+            user: remoteConfig['user'] as String,
+            password: remoteConfig['pass'] as String,
+            // debug: true,
+          );
+        }
+        final webDavClient = _webDavClientCache[remoteId]!;
+        final res = await webDavClient.readDir(parsedPath.path);
+        final di = DirectoryIndex(
+          directories: {},
+          files: {},
+        );
+
+        for (final e in res) {
+          final name = e.name ?? '';
+          if (e.isDir ?? false) {
+            di.directories[name] = DirectoryDirectory(
+              name: name,
+              created: e.mTime?.millisecondsSinceEpoch ??
+                  e.cTime?.millisecondsSinceEpoch ??
+                  0,
+            );
+          } else {
+            di.files[name] = DirectoryFile(
+                name: name,
+                created: e.cTime?.millisecondsSinceEpoch ?? 0,
+                modified: e.mTime?.millisecondsSinceEpoch ?? 0,
+                version: 0,
+                mimeType: e.mimeType,
+                file: FileData(
+                  chunkSize: null,
+                  encryptionType: null,
+                  hash: '0000${e.eTag}',
+                  key: null,
+                  size: e.size ?? 0,
+                  ts: e.mTime?.millisecondsSinceEpoch ?? 0,
+                  url: 'remote-$remoteId:/${e.path}',
+                  padding: null,
+                ));
+          }
+        }
+        return di;
+      } else {
+        throw 'Remote type ${remote['type']} not supported';
+      }
+    }
+
     final uriHash = convertUriToHashForCache(parsedPath);
 
     log('getDirectoryIndex $parsedPath');
@@ -1316,6 +1439,8 @@ class FileSystemDAC {
 
     log('createFile $path $name [skapp: $skapp]');
 
+    DirectoryFile? createdFile;
+
     final res = await doOperationOnDirectory(
       path,
       (directoryIndex) async {
@@ -1334,9 +1459,14 @@ class FileSystemDAC {
         );
         file.file.ext = null;
         directoryIndex.files[name] = file;
+
+        createdFile = file;
         // submitFileToIndexer(directoryPath, file);
       },
     );
+    if (createdFile != null) {
+      res.data = json.decode(json.encode(createdFile));
+    }
     return res;
   }
 
@@ -1841,7 +1971,7 @@ class FileSystemDAC {
       encryptionType: res.encryptionType,
       padding: res.padding,
       url: res.blobUrl,
-      key: base64Url.encode(res.secretKey),
+      key: base64Url.encode(res.secretKey!),
       hash: multihash,
       hashes: hashes,
       size: size,
@@ -1961,7 +2091,7 @@ class FileSystemDAC {
   }) async {
     log('downloadAndDecryptFile');
 
-    final chunkSize = fileData.chunkSize; // ?? maxChunkSize;
+    final chunkSize = fileData.chunkSize ?? maxChunkSize; // ?? maxChunkSize;
 
     onProgress ??= (double progress) {
       setFileState(
@@ -1977,7 +2107,7 @@ class FileSystemDAC {
 
     final streamCtrl = StreamController<SecretStreamCipherMessage>();
 
-    final secretKey = base64Url.decode(fileData.key);
+    final secretKey = base64Url.decode(fileData.key!);
     final transformer = sodium.crypto.secretStream
         .createPullEx(
           SecureKey.fromList(
@@ -1991,7 +2121,6 @@ class FileSystemDAC {
     final url = Uri.parse(
       client.resolveSkylink(
         fileData.url,
-        trusted: true, // TODO Maybe remove this
       )!,
     );
     late Stream<List<int>> stream;
@@ -2109,7 +2238,9 @@ class FileSystemDAC {
   }) async {
     log('[download+decrypt] using libsodium_secretbox');
 
-    final chunkSize = fileData.chunkSize;
+    final chunkSize = fileData.chunkSize ?? maxChunkSize;
+
+    final padding = fileData.padding ?? 0;
 
     onProgress ??= (double progress) {
       setFileState(
@@ -2123,15 +2254,15 @@ class FileSystemDAC {
 
     onProgress(0.0);
 
-    final totalEncSize = ((fileData.size / fileData.chunkSize).floor() *
-            (fileData.chunkSize + 16)) +
-        (fileData.size % fileData.chunkSize) +
-        16 +
-        fileData.padding;
+    final totalEncSize =
+        ((fileData.size / chunkSize).floor() * (chunkSize + 16)) +
+            (fileData.size % chunkSize) +
+            16 +
+            padding;
 
     final streamCtrl = StreamController<Uint8List>();
 
-    final secretKey = base64Url.decode(fileData.key);
+    final secretKey = base64Url.decode(fileData.key!);
     final key = SecureKey.fromList(
       sodium,
       secretKey,
@@ -2140,7 +2271,6 @@ class FileSystemDAC {
     final url = Uri.parse(
       client.resolveSkylink(
         fileData.url,
-        trusted: true, // TODO Maybe remove this
       )!,
     );
     final downloadStreamCtrl = StreamController<List<int>>();
@@ -2259,9 +2389,9 @@ class FileSystemDAC {
             nonce: nonce,
             key: key,
           );
-          if (fileData.padding > 0) {
+          if (padding > 0) {
             log('[download+decrypt] remove padding...');
-            streamCtrl.add(r.sublist(0, r.length - fileData.padding));
+            streamCtrl.add(r.sublist(0, r.length - padding));
           } else {
             streamCtrl.add(r);
           }
@@ -2601,10 +2731,10 @@ class UploadingFilesChangeNotifier
 
 class EncryptAndUploadResponse {
   final String blobUrl;
-  final Uint8List secretKey;
-  final String encryptionType;
-  final int maxChunkSize;
-  final int padding;
+  final Uint8List? secretKey;
+  final String? encryptionType;
+  final int? maxChunkSize;
+  final int? padding;
   // final Uint8List nonce;
   EncryptAndUploadResponse({
     required this.blobUrl,
@@ -2660,12 +2790,16 @@ class DirectoryOperationTask {
 class DirectoryOperationTaskResult {
   bool success;
   String? error;
+  dynamic data;
   DirectoryOperationTaskResult(this.success, {this.error});
 
   Map toJson() {
     final map = <String, dynamic>{'success': success};
     if (!success) {
       map['error'] = error;
+    }
+    if (data != null) {
+      map['data'] = data;
     }
     return map;
   }

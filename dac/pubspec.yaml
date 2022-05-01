@@ -28,6 +28,9 @@ dependencies:
   uuid: ^3.0.5
   stash: ^4.0.1
   mime_type: ^1.0.0
+  stash_hive: ^4.0.1
+  webdav_client:
+    git: https://github.com/redsolver/webdav_client.git
   # cure: ^0.1.0-nullsafety.0
 
 dev_dependencies:

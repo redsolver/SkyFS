@@ -15,17 +15,22 @@ import 'package:skynet/src/mysky_provider/web.dart';
 import 'package:skynet/src/utils/base32.dart';
 import 'package:skynet/src/utils/convert.dart';
 import 'package:skynet/src/mysky/tweak.dart';
+import 'package:skynet/src/mysky/encrypted_files.dart';
 
 import 'package:filesystem_dac/sodium.dart';
 import 'package:skynet/skynet.dart';
 import 'package:skynet/src/skystandards/fs.dart';
 import 'package:sodium/sodium.dart';
 import 'package:skynet/src/skynet_tus_client_web.dart';
+import 'package:skynet/src/encode_endian/encode_endian.dart';
+import 'package:skynet/src/encode_endian/base.dart';
+import 'package:stash/stash_api.dart';
+import 'package:stash_hive/stash_hive.dart';
 
 final uploadPool = Pool(4);
 final downloadPool = Pool(4);
 
-final version = '0.6.0';
+final version = '0.8.2';
 
 // ! This Map maps resolver skylinks to their HNS domains.
 // ! This is a temporary solution.
@@ -269,7 +274,7 @@ class WebWrapper {
   Future<Blob> downloadFileData(List args) async {
     final fileData = FileData.fromJson(args[0].cast<String, dynamic>());
 
-    final String mimeType = args[1];
+    final String mimeType = args[1] ?? 'application/octet-stream';
     final Map? callback = args.length > 2 ? args[2] : null;
     final onProgress = (progress) {
       if (callback != null) {
@@ -282,7 +287,7 @@ class WebWrapper {
     };
 
     // TODO Using this callback is highly experimental and not recommended
-    if (args.length > 3 && args[3] != null && args[3] is Map) {
+    /* if (args.length > 3 && args[3] != null && args[3] is Map) {
       final Map onChunkCallback = args[3];
 
       // TODO Blob mime type
@@ -298,19 +303,34 @@ class WebWrapper {
           [chunk],
         );
       }
+    } else { */
+
+    if (fileData.encryptionType == 'libsodium_secretbox') {
+      return Blob(
+        await (await downloadAndDecryptFileInChunksWeb(
+          fileData,
+          onProgress: onProgress,
+          client: dac.client,
+          sodium: dac.sodium,
+        ))
+            .toList(),
+        mimeType,
+      );
     } else {
       return Blob(
-          await (await downloadAndDecryptFileWeb(
-            fileData,
-            onProgress: onProgress,
-            client: dac.client,
-            sodium: dac.sodium,
-          ))
-              .toList(),
-          mimeType);
+        await (await downloadAndDecryptFileWebDeprecated(
+          fileData,
+          onProgress: onProgress,
+          client: dac.client,
+          sodium: dac.sodium,
+        ))
+            .toList(),
+        mimeType,
+      );
     }
+    /*  } */
 
-    return Blob(
+    /* return Blob(
         await (await downloadAndDecryptFileWeb(
           fileData,
           onProgress: onProgress,
@@ -318,7 +338,7 @@ class WebWrapper {
           sodium: dac.sodium,
         ))
             .toList(),
-        mimeType);
+        mimeType); */
   }
 
   Future<Blob> loadThumbnail(List args) async {
@@ -383,9 +403,12 @@ class WebWrapper {
               return res;
             }
           : null,
-      customEncryptAndUploadFileFunction: () => encryptAndUploadFile(
-        getStreamOfFile(buffer), multihash,
-        client: dac.client, sodium: dac.sodium, length: blob.size, // TODO
+      customEncryptAndUploadFileFunction: () => encryptAndUploadFileInChunks(
+        getStreamOfFile(buffer),
+        multihash,
+        client: dac.client,
+        sodium: dac.sodium,
+        totalSize: blob.size,
         onProgress: (progress) {
           if (callback != null) {
             _callback(
@@ -441,11 +464,19 @@ class WebWrapper {
 
       final sodium = await loadSodiumInBrowser();
 
+      final hiveStore = newHiveDefaultCacheStore();
+
+      final thumbnailCache = hiveStore.cache<Uint8List>(
+        name: 'thumbnailCache',
+        maxEntries: 1000,
+      );
+
       dac = FileSystemDAC(
         mySkyProvider: WebMySkyProvider(SkynetClient()),
         skapp: skapp,
         sodium: sodium,
         debugEnabled: DEBUG_ENABLED,
+        thumbnailCache: thumbnailCache,
       );
 
       // load mysky
@@ -507,6 +538,203 @@ class WebWrapper {
 
     return '1220$hash';
   }
+
+  Future<Stream<Uint8List>> downloadAndDecryptFileInChunksWeb(
+    FileData fileData, {
+    required Function onProgress,
+    required Sodium sodium,
+    required SkynetClient client,
+  }) async {
+    print('[download+decrypt] using libsodium_secretbox');
+
+    final downloadChunkSize = 8 * 1000 * 1000;
+
+    final chunkSize = fileData.chunkSize ?? maxChunkSize;
+    final padding = fileData.padding ?? 0;
+
+    onProgress(0.0);
+
+    final totalEncSize =
+        ((fileData.size / chunkSize).floor() * (chunkSize + 16)) +
+            (fileData.size % chunkSize) +
+            16 +
+            padding;
+
+    final streamCtrl = StreamController<Uint8List>();
+
+    final secretKey = base64Url.decode(fileData.key!);
+    final key = SecureKey.fromList(
+      sodium,
+      secretKey,
+    );
+
+    final url = Uri.parse(
+      client.resolveSkylink(
+        fileData.url,
+        trusted: true, // TODO Maybe remove this
+      )!,
+    );
+    final downloadStreamCtrl = StreamController<List<int>>();
+
+    StreamSubscription? sub;
+    int downloadedLength = 0;
+    int lastProgress = 0;
+
+    late HttpRequest req;
+
+    void sendDownloadRequest() async {
+      try {
+        final completer = Completer<Blob?>();
+
+        req = HttpRequest();
+        req.withCredentials = true;
+
+        req.open('GET', url.toString());
+
+        final lastByteOfChunk =
+            min(downloadedLength + downloadChunkSize - 1, totalEncSize - 1);
+
+        req.setRequestHeader(
+            'range', 'bytes=$downloadedLength-$lastByteOfChunk');
+
+        req.onProgress.listen((event) {
+          lastProgress = event.loaded!;
+          onProgress((downloadedLength + event.loaded!) / totalEncSize);
+        });
+
+        req.responseType = 'blob';
+        req.onLoadEnd.listen((event) {
+          completer.complete(req.response);
+        });
+        req.onError.listen((event) {
+          completer.complete(null);
+        });
+
+        req.send('');
+
+        final blob = await completer.future;
+
+        if (blob == null) {
+          throw 'Chunk download failed';
+        }
+
+        final buffer = await promiseToFuture<ByteBuffer>(
+            await callMethod(blob, 'arrayBuffer', []));
+
+        downloadStreamCtrl.add(buffer.asUint8List());
+
+        await Future.delayed(Duration(milliseconds: 20));
+        sendDownloadRequest();
+      } catch (e, st) {
+        print(e);
+        print(st);
+      }
+    }
+
+    final completer = Completer<bool>();
+
+    final List<int> data = [];
+    sendDownloadRequest();
+
+    StreamSubscription? progressSub;
+
+    int lastProgressCache = 0;
+    DateTime lastDownloadedLengthTS = DateTime.now();
+
+    progressSub = Stream.periodic(Duration(milliseconds: 200)).listen((event) {
+      final progress = downloadedLength / totalEncSize;
+      // onProgress!(progress);
+      if (lastProgressCache != lastProgress) {
+        lastProgressCache = lastProgress;
+        lastDownloadedLengthTS = DateTime.now();
+      } else {
+        final diff = DateTime.now().difference(lastDownloadedLengthTS);
+        if (diff > Duration(seconds: 20)) {
+          print('detected download issue, reconnecting...');
+          req.abort();
+          lastDownloadedLengthTS = DateTime.now();
+
+          sub?.cancel();
+          sendDownloadRequest();
+        }
+      }
+    });
+
+    int currentChunk = 0;
+
+    final _downloadSub = downloadStreamCtrl.stream.listen(
+      (List<int> newBytes) {
+        data.addAll(newBytes);
+
+        downloadedLength += newBytes.length;
+
+        while (data.length > (chunkSize + 16)) {
+          log('[download+decrypt] decrypt chunk...');
+
+          final nonce = Uint8List.fromList(
+            encodeEndian(
+              currentChunk,
+              sodium.crypto.secretBox.nonceBytes,
+              endianType: EndianType.littleEndian,
+            ) as List<int>,
+          );
+
+          final r = sodium.crypto.secretBox.openEasy(
+            cipherText: Uint8List.fromList(
+              data.sublist(0, chunkSize + 16),
+            ),
+            nonce: nonce,
+            key: key,
+          );
+          streamCtrl.add(r);
+
+          currentChunk++;
+
+          data.removeRange(0, chunkSize + 16);
+        }
+
+        if (downloadedLength == totalEncSize) {
+          log('[download+decrypt] decrypt final chunk...');
+
+          final nonce = Uint8List.fromList(
+            encodeEndian(
+              currentChunk,
+              sodium.crypto.secretBox.nonceBytes,
+              endianType: EndianType.littleEndian,
+            ) as List<int>,
+          );
+
+          final r = sodium.crypto.secretBox.openEasy(
+            cipherText: Uint8List.fromList(
+              data,
+            ),
+            nonce: nonce,
+            key: key,
+          );
+          if (padding > 0) {
+            log('[download+decrypt] remove padding...');
+            streamCtrl.add(r.sublist(0, r.length - padding));
+          } else {
+            streamCtrl.add(r);
+          }
+          downloadStreamCtrl.close();
+        }
+      },
+      onDone: () async {
+        await progressSub?.cancel();
+        await streamCtrl.close();
+
+        completer.complete(true);
+      },
+      onError: (e) {
+        progressSub?.cancel();
+        // TODO Handle error
+      },
+      cancelOnError: true,
+    );
+
+    return streamCtrl.stream;
+  }
 }
 
 Stream<Uint8List> getStreamOfFile(ByteBuffer buffer) async* {
@@ -528,10 +756,9 @@ Stream<Uint8List> getStreamOfFile(ByteBuffer buffer) async* {
 
 const TUS_CHUNK_SIZE = (1 << 22) * 10; // ~ 41 MB
 
-final downloadChunkSize = 32 * 1000 * 1000;
-
 Stream<Blob> _downloadFileInChunks(
     Uri url, int totalSize, Function onProgress) async* {
+  final downloadChunkSize = 32 * 1000 * 1000;
   for (int i = 0; i < totalSize; i += downloadChunkSize) {
     try {
       final completer = Completer<Blob?>();
@@ -587,7 +814,7 @@ Stream<Blob> _downloadFileInChunks(
   }
 }
 
-Future<Stream<Blob>> downloadAndDecryptFileWeb(
+Future<Stream<Blob>> downloadAndDecryptFileWebDeprecated(
   FileData fileData, {
   required Function onProgress,
   required SkynetClient client,
@@ -595,7 +822,7 @@ Future<Stream<Blob>> downloadAndDecryptFileWeb(
 }) async {
   print('[FileSystem DAC] [web] using new download code');
 
-  final chunkSize = fileData.chunkSize; // ?? maxChunkSize;
+  final chunkSize = fileData.chunkSize ?? maxChunkSize;
 
   final encryptedLength =
       fileData.size + 24 + (fileData.size / chunkSize).ceil() * 17;
@@ -604,7 +831,7 @@ Future<Stream<Blob>> downloadAndDecryptFileWeb(
 
   final streamCtrl = StreamController<SecretStreamCipherMessage>();
 
-  final secretKey = base64Url.decode(fileData.key);
+  final secretKey = base64Url.decode(fileData.key!);
   final transformer = sodium.crypto.secretStream
       .createPullEx(
         SecureKey.fromList(
@@ -625,7 +852,7 @@ Future<Stream<Blob>> downloadAndDecryptFileWeb(
 
   int totalDownloadLength = encryptedLength;
 
-  if (totalDownloadLength > (maxChunkSize + 100)) {
+  if (totalDownloadLength > (chunkSize + 100)) {
     stream = _downloadFileInChunks(url, totalDownloadLength, onProgress);
   } else {
     final streamCtrl = StreamController<Blob>();
@@ -715,6 +942,7 @@ Future<Stream<Blob>> downloadAndDecryptFileWeb(
     },
     onDone: () async {},
     onError: (e) {
+      progressSub?.cancel();
       // TODO Handle error
     },
     cancelOnError: true,
@@ -723,7 +951,106 @@ Future<Stream<Blob>> downloadAndDecryptFileWeb(
   return transformer.map((event) => Blob([event.message]));
 }
 
-Future<EncryptAndUploadResponse> encryptAndUploadFile(
+Future<EncryptAndUploadResponse> encryptAndUploadFileInChunks(
+  Stream<Uint8List> stream,
+  String fileMultiHash, {
+  required int totalSize,
+  required SkynetClient client,
+  required Sodium sodium,
+  required Function(double) onProgress,
+}) async {
+  final secretKey = sodium.crypto.secretStream.keygen();
+
+  int internalSize = 0;
+
+  var padding = padFileSize(totalSize) - totalSize;
+
+  final lastChunkSize = totalSize % maxChunkSize;
+
+  if ((padding + lastChunkSize) >= maxChunkSize) {
+    padding = maxChunkSize - lastChunkSize;
+  }
+
+  print('padding: $padding | ${lastChunkSize} | ${totalSize}');
+
+  final encryptedLength =
+      ((totalSize / maxChunkSize).floor() * (maxChunkSize + 16)) +
+          lastChunkSize +
+          16 +
+          padding;
+
+  int i = 0;
+
+  final outStream = stream.map((event) {
+    internalSize += event.length;
+    final isLastChunk = internalSize == totalSize;
+
+    final nonce = Uint8List.fromList(
+      encodeEndian(i, sodium.crypto.secretBox.nonceBytes,
+          endianType: EndianType.littleEndian) as List<int>,
+    );
+    i++;
+
+    final res = sodium.crypto.secretBox.easy(
+      message:
+          isLastChunk ? Uint8List.fromList(event + Uint8List(padding)) : event,
+      nonce: nonce,
+      key: secretKey,
+    );
+    return res;
+  });
+
+  onProgress(0);
+
+  if (encryptedLength > TUS_CHUNK_SIZE) {
+    final tusClient = SkynetTusClientWeb(
+      Uri.https(client.portalHost, '/skynet/tus'),
+      skynetClient: client,
+      maxChunkSize: TUS_CHUNK_SIZE,
+      streamFileLength: encryptedLength,
+      filename: 'fs-dac.hns',
+      headers: client.headers,
+    );
+
+    var totalEncryptedSize = 0;
+    final result = await tusClient.upload(
+      outStream.map((event) {
+        totalEncryptedSize += event.length;
+
+        return Blob([event]);
+      }),
+      onProgress: onProgress,
+    );
+
+    return EncryptAndUploadResponse(
+      blobUrl: 'sia://$result',
+      secretKey: secretKey.extractBytes(),
+      maxChunkSize: maxChunkSize,
+      padding: padding,
+      encryptionType: 'libsodium_secretbox',
+    );
+  } else {
+    final result = await client.upload.uploadFileWithStream(
+      SkyFile(
+        content: Uint8List(0),
+        filename: 'fs-dac.hns',
+        type: 'application/octet-stream',
+      ),
+      encryptedLength,
+      outStream,
+    );
+    onProgress(1);
+    return EncryptAndUploadResponse(
+      blobUrl: 'sia://$result',
+      secretKey: secretKey.extractBytes(),
+      maxChunkSize: maxChunkSize,
+      padding: padding,
+      encryptionType: 'libsodium_secretbox',
+    );
+  }
+}
+
+Future<EncryptAndUploadResponse> encryptAndUploadFileDeprecated(
   Stream<Uint8List> stream,
   String fileMultiHash, {
   required int length,
@@ -774,8 +1101,11 @@ Future<EncryptAndUploadResponse> encryptAndUploadFile(
     );
 
     return EncryptAndUploadResponse(
-      skylink: result,
+      blobUrl: 'sia://$result',
       secretKey: secretKey.extractBytes(),
+      maxChunkSize: maxChunkSize,
+      padding: 0,
+      encryptionType: 'AEAD_XCHACHA20_POLY1305',
     );
   } else {
     final result = await client.upload.uploadFileWithStream(
@@ -791,8 +1121,11 @@ Future<EncryptAndUploadResponse> encryptAndUploadFile(
     );
     onProgress(1);
     return EncryptAndUploadResponse(
-      skylink: result!,
+      blobUrl: 'sia://$result',
       secretKey: secretKey.extractBytes(),
+      maxChunkSize: maxChunkSize,
+      padding: 0,
+      encryptionType: 'AEAD_XCHACHA20_POLY1305',
     );
   }
 }
