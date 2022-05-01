@@ -19,11 +19,11 @@ export interface FileData {
     /**
      * The secret key used to encrypt this file, base64Url-encoded
      */
-    key: string
+    key?: string
     /**
      * Which algorithm is used to encrypt and decrypt this file
      */
-    encryptionType: string
+    encryptionType?: string
 
     /**
      * Unencrypted size of the file, in bytes
@@ -31,9 +31,14 @@ export interface FileData {
     size: number
 
     /**
+     * Padding bytes count
+     */
+    padding?: number
+
+    /**
      * maxiumum size of every unencrypted file chunk in bytes
      */
-    chunkSize: number
+    chunkSize?: number
     hash: Multihash
     /**
      * Unix timestamp (in milliseconds) when this version was added to the FileSystem DAC

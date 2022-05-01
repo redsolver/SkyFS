@@ -148,6 +148,26 @@ export class FileSystemDAC extends DacLibrary {
       .call("createFile", directoryPath, name, fileData);
   }
 
+  public async createFileWithReturnValue(
+    directoryPath: string,
+    name: string,
+    fileData: FileData,
+  ): Promise<DirectoryFile> {
+    if (!this.connector) {
+      throw new Error("Connector not initialized");
+    }
+
+    const res: IFileSystemDACResponse = await this.connector.connection
+      .remoteHandle()
+      .call("createFile", directoryPath, name, fileData);
+
+    if (!res.success) {
+      throw new Error(res.error);
+    }
+
+    return res.data as DirectoryFile;
+  }
+
   public async updateFile(
     directoryPath: string,
     name: string,
