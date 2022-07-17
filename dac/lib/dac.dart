@@ -549,12 +549,11 @@ class FileSystemDAC {
 
   Future<void> saveMounts() async {
     log('> saveMounts');
-    final res = await mySkyProvider.setJSONEncrypted(
+    await mySkyProvider.setJSONEncrypted(
       _mountsPath,
       mounts,
       _lastMountsResponse.revision + 1,
     );
-    if (res != true) throw 'saveMounts failed';
 
     // ignore: unawaited_futures
     directoryIndexCache.put(
@@ -689,12 +688,11 @@ class FileSystemDAC {
 
   Future<void> saveRemotes() async {
     log('> saveRemotes');
-    final res = await mySkyProvider.setJSONEncrypted(
+    await mySkyProvider.setJSONEncrypted(
       _remotesPath,
       customRemotes,
       _lastRemotesResponse.revision + 1,
     );
-    if (res != true) throw 'saveRemotes failed';
 
     // ignore: unawaited_futures
     directoryIndexCache.put(
