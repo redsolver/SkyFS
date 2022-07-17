@@ -9,10 +9,14 @@ class CachedEntry {
   @HiveField(2)
   final String data;
 
+  @HiveField(3)
+  final String? skylink;
+
   CachedEntry({
     required this.revision,
     required this.data,
+    required this.skylink,
   });
 
-  Map<String, dynamic> toJson() => {'r': revision, 'd': data};
+  Map<String, dynamic> toJson() => {'r': revision, 'd': data, 's': skylink};
 }

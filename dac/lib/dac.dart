@@ -108,7 +108,7 @@ Future<List> extractMetadata(List list) async {
 
   List more = [];
 
-  bool hasThumbnail = false;
+  bool hasThumbnail = true;
 
   Map<String, dynamic>? ext;
 
@@ -242,23 +242,27 @@ Future<List> extractMetadata(List list) async {
   if (ext?['audio']?['isrc'] != null) {
     ext!['audio']['isrc'] = ext['audio']['isrc'].trim();
   }
+
   // TODO audio length on web (use ffmpeg)
+
+  ext?.remove('mp3');
+  ext?.remove('flac');
 
   if (hasThumbnail || supportedImageExtensions.contains(extension)) {
     try {
-      var image = img.decodeImage(bytes);
-      if (image != null) {
+      var thumbnail = img.decodeImage(bytes);
+      if (thumbnail != null) {
         ext ??= {};
 
-        if (!hasThumbnail) {
+        /*  if (!hasThumbnail) {
           ext['image'] = {
             'width': image.width,
             'height': image.height,
           };
         }
-
+ */
         // Resize the image to a 200x? thumbnail (maintaining the aspect ratio).
-        final thumbnail = image.width > image.height
+        /*   final thumbnail = image.width > image.height
             ? img.copyResize(
                 image,
                 height: 200,
@@ -266,7 +270,7 @@ Future<List> extractMetadata(List list) async {
             : img.copyResize(
                 image,
                 width: 200,
-              ); // TODO Adjust, maybe use boxFit: cover
+              ); */ // TODO Adjust, maybe use boxFit: cover
 
         final thumbnailBytes = img.encodeJpg(thumbnail, quality: 80);
 
@@ -399,6 +403,9 @@ class FileSystemDAC {
     }
     return _uploadingFilesChangeNotifiers[path]!;
   }
+  Map<String, UploadingFilesChangeNotifier> getAllUploadingFilesChangeNotifiers(){
+    return _uploadingFilesChangeNotifiers;
+  }
 
   Future<void> init({bool devEnabled = false}) async {
     rootAccessEnabled =
@@ -417,7 +424,7 @@ class FileSystemDAC {
     );
 
     deletedSkylinks = await Hive.openBox<String>(
-      'skyfs-deleted-skylinks',
+      'skyfs-skylinks-to-unpin',
     );
 
     if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
@@ -525,7 +532,10 @@ class FileSystemDAC {
       directoryIndexCache.put(
         _mountsPath,
         CachedEntry(
-            revision: _lastMountsResponse.revision, data: json.encode(mounts)),
+          revision: _lastMountsResponse.revision,
+          data: json.encode(mounts),
+          skylink: _lastMountsResponse.skylink,
+        ),
       );
     } catch (e, st) {
       log('[loadMounts] $e $st');
@@ -550,7 +560,10 @@ class FileSystemDAC {
     directoryIndexCache.put(
       _mountsPath,
       CachedEntry(
-          revision: _lastMountsResponse.revision, data: json.encode(mounts)),
+        revision: _lastMountsResponse.revision,
+        data: json.encode(mounts),
+        skylink: null, // TODO Store skylink
+      ),
     );
     log('< saveMounts');
   }
@@ -659,8 +672,10 @@ class FileSystemDAC {
       directoryIndexCache.put(
         _remotesPath,
         CachedEntry(
-            revision: _lastRemotesResponse.revision,
-            data: json.encode(customRemotes)),
+          revision: _lastRemotesResponse.revision,
+          data: json.encode(customRemotes),
+          skylink: _lastRemotesResponse.skylink,
+        ),
       );
     } catch (e, st) {
       log('[loadRemotes] $e $st');
@@ -685,8 +700,10 @@ class FileSystemDAC {
     directoryIndexCache.put(
       _remotesPath,
       CachedEntry(
-          revision: _lastRemotesResponse.revision,
-          data: json.encode(customRemotes)),
+        revision: _lastRemotesResponse.revision,
+        data: json.encode(customRemotes),
+        skylink: null, // TODO Store skylink
+      ),
     );
     log('< saveRemotes');
   }
@@ -778,26 +795,28 @@ class FileSystemDAC {
     }
     log('doUpdate $doUpdate');
 
+    String? newSkylink;
+
     var result = DirectoryOperationTaskResult(true);
     if (doUpdate) {
       if (uri.host == 'local') {
         // TODO Retry when an error happens here
-        final success = await mySkyProvider.setJSONEncrypted(
+        final newRes = await mySkyProvider.setJSONEncrypted(
           uriPathToMySkyPath(uri.pathSegments),
           directoryIndex,
           res.revision + 1,
         );
 
-        if (success != true) throw 'Something went wrong';
+        newSkylink = newRes.skylink;
 
-        result = DirectoryOperationTaskResult(success);
+        result = DirectoryOperationTaskResult(true);
       } else {
         final userInfo = uri.userInfo;
 
         final skynetUser = await _getSkynetUser(userInfo);
         final path = [...uri.pathSegments, 'index.json'].join('/');
 
-        final success = await mysky_io_impl.setEncryptedJSON(
+        final newRes = await mysky_io_impl.setEncryptedJSON(
           skynetUser,
           path,
           directoryIndex,
@@ -805,9 +824,12 @@ class FileSystemDAC {
           skynetClient: client,
         );
 
-        if (success != true) throw 'Something went wrong';
+        newSkylink = newRes.skylink;
 
-        result = DirectoryOperationTaskResult(success);
+        result = DirectoryOperationTaskResult(true);
+      }
+      if (res.skylink != null) {
+        deletedSkylinks.add(res.skylink!);
       }
     }
     for (final task in tasks) {
@@ -817,20 +839,22 @@ class FileSystemDAC {
     }
 
     if (uri.path == '/' + DATA_DOMAIN) return;
+    if (doUpdate) {
+      getDirectoryIndexChangeNotifier(
+        uriHash,
+      ).updateDirectoryIndex(directoryIndex);
 
-    getDirectoryIndexChangeNotifier(
-      uriHash,
-    ).updateDirectoryIndex(directoryIndex);
-
-    directoryIndexCache.put(
-      uriHash,
-      CachedEntry(
-        revision: res.revision + 1,
-        data: json.encode(
-          directoryIndex,
+      directoryIndexCache.put(
+        uriHash,
+        CachedEntry(
+          revision: res.revision + 1,
+          data: json.encode(
+            directoryIndex,
+          ),
+          skylink: newSkylink,
         ),
-      ),
-    );
+      );
+    }
   }
 
   String uriPathToMySkyPath(List<String> pathSegments) {
@@ -1181,6 +1205,7 @@ class FileSystemDAC {
           CachedEntry(
             data: json.encode(res.data),
             revision: res.revision,
+            skylink: res.skylink,
           ),
         );
         hasUpdate = true;
@@ -1191,6 +1216,7 @@ class FileSystemDAC {
         CachedEntry(
           data: json.encode(res.data),
           revision: res.revision,
+          skylink: res.skylink,
         ),
       );
       hasUpdate = true;
@@ -1306,8 +1332,9 @@ class FileSystemDAC {
   }
 
   Future<DirectoryOperationTaskResult> deleteDirectoryRecursive(
-    String path,
-  ) async {
+    String path, {
+    bool unpinEverything = false,
+  }) async {
     final uri = parsePath(path);
 
     validateAccess(
@@ -1322,16 +1349,22 @@ class FileSystemDAC {
       uri,
       (directoryIndex) async {
         for (final name in directoryIndex.directories.keys) {
-          final res =
-              await deleteDirectoryRecursive(getChildUri(uri, name).toString());
+          final res = await deleteDirectoryRecursive(
+            getChildUri(uri, name).toString(),
+            unpinEverything: unpinEverything,
+          );
           if (!res.success) {
             throw res.error!;
           }
         }
         directoryIndex.directories = {};
-        for (final file in directoryIndex.files.values) {
-          deleteFileSkylinks(file);
+
+        if (unpinEverything) {
+          for (final file in directoryIndex.files.values) {
+            deleteFileSkylinks(file);
+          }
         }
+
         directoryIndex.files = {};
       },
     );
@@ -1751,7 +1784,10 @@ class FileSystemDAC {
 
     await createDirectory(newPath.directoryPath, newPath.fileName);
 
-    final res = await deleteDirectoryRecursive(sourceDirectoryPath);
+    final res = await deleteDirectoryRecursive(
+      sourceDirectoryPath,
+      unpinEverything: false,
+    );
 
     if (!res.success) return res;
 
@@ -1903,7 +1939,9 @@ class FileSystemDAC {
       print('trying to extract metadata...');
 
       final rootPathSeed = await mySkyProvider.getEncryptedFileSeed(
-          DATA_DOMAIN, true); // TODO Make this work when not logged in
+        DATA_DOMAIN,
+        true,
+      ); // TODO Make this work when not logged in
 
       final res = await generateMetadataWrapper!(extension(filename!),
           rootPathSeed /* extractMetadata, [bytes, rootPathSeed] */);
@@ -1971,7 +2009,7 @@ class FileSystemDAC {
       encryptionType: res.encryptionType,
       padding: res.padding,
       url: res.blobUrl,
-      key: base64Url.encode(res.secretKey!),
+      key: res.secretKey == null ? null : base64Url.encode(res.secretKey!),
       hash: multihash,
       hashes: hashes,
       size: size,
@@ -2574,11 +2612,19 @@ class FileSystemDAC {
       final data = decryptJSONFile(contentRes.bodyBytes, encryptionKey);
 
       if (data.containsKey('_data')) {
-        return DataWithRevision(data['_data'], res.entry.revision);
+        return DataWithRevision(
+          data['_data'],
+          res.entry.revision,
+          skylink: skylink,
+        );
       }
-      return DataWithRevision(data, res.entry.revision);
+      return DataWithRevision(data, res.entry.revision, skylink: skylink);
     } else {
-      return DataWithRevision(json.decode(cached!.data), cached.revision);
+      return DataWithRevision(
+        json.decode(cached!.data),
+        cached.revision,
+        skylink: cached.skylink,
+      );
     }
   }
 
