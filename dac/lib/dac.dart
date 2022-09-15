@@ -446,14 +446,13 @@ class FileSystemDAC {
         );
       }
     } else {
-      throw 'Not implemented';
-      /*   directoryIndexCache = await Hive.openBox<CachedEntry>(
+      directoryIndexCache = await Hive.openBox<CachedEntry>(
         'fs-dac-directory-index-cache',
       );
 
       deletedSkylinks = await Hive.openBox<String>(
         'skyfs-skylinks-to-unpin',
-      ); */
+      );
     }
 
     if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
