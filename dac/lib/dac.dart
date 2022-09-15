@@ -403,29 +403,58 @@ class FileSystemDAC {
     }
     return _uploadingFilesChangeNotifiers[path]!;
   }
-  Map<String, UploadingFilesChangeNotifier> getAllUploadingFilesChangeNotifiers(){
+
+  Map<String, UploadingFilesChangeNotifier>
+      getAllUploadingFilesChangeNotifiers() {
     return _uploadingFilesChangeNotifiers;
   }
 
-  Future<void> init({bool devEnabled = false}) async {
+  Future<void> init(
+      {bool devEnabled = false, bool inMemoryOnly = false}) async {
     rootAccessEnabled =
         !UniversalPlatform.isWeb || domainsWithRootAccess.contains(skapp);
     log('rootAccessEnabled $rootAccessEnabled');
     final opts = {
       'dev': devEnabled,
     };
+
     await mySkyProvider.load(
       DATA_DOMAIN,
       options: opts,
     );
-    Hive.registerAdapter(CachedEntryAdapter());
-    directoryIndexCache = await Hive.openBox<CachedEntry>(
-      'fs-dac-directory-index-cache',
-    );
 
-    deletedSkylinks = await Hive.openBox<String>(
-      'skyfs-skylinks-to-unpin',
-    );
+    Hive.registerAdapter(CachedEntryAdapter());
+
+    if (UniversalPlatform.isWeb) {
+      if (inMemoryOnly) {
+        directoryIndexCache = await Hive.openBox<CachedEntry>(
+          'fs-dac-directory-index-cache',
+          bytes: Uint8List(0),
+        );
+
+        deletedSkylinks = await Hive.openBox<String>(
+          'skyfs-skylinks-to-unpin',
+          bytes: Uint8List(0),
+        );
+      } else {
+        directoryIndexCache = await Hive.openBox<CachedEntry>(
+          'fs-dac-directory-index-cache',
+        );
+
+        deletedSkylinks = await Hive.openBox<String>(
+          'skyfs-skylinks-to-unpin',
+        );
+      }
+    } else {
+      throw 'Not implemented';
+      /*   directoryIndexCache = await Hive.openBox<CachedEntry>(
+        'fs-dac-directory-index-cache',
+      );
+
+      deletedSkylinks = await Hive.openBox<String>(
+        'skyfs-skylinks-to-unpin',
+      ); */
+    }
 
     if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
       Hive.deleteBoxFromDisk('fs-dac-thumbnail-cache');
@@ -2271,6 +2300,7 @@ class FileSystemDAC {
   Future<Stream<Uint8List>> downloadAndDecryptFileInChunks(
     FileData fileData, {
     Function? onProgress,
+    DownloadConfig? downloadConfig,
   }) async {
     log('[download+decrypt] using libsodium_secretbox');
 
@@ -2305,9 +2335,10 @@ class FileSystemDAC {
     );
 
     final url = Uri.parse(
-      client.resolveSkylink(
-        fileData.url,
-      )!,
+      downloadConfig?.url ??
+          client.resolveSkylink(
+            fileData.url,
+          )!,
     );
     final downloadStreamCtrl = StreamController<List<int>>();
 
@@ -2319,6 +2350,10 @@ class FileSystemDAC {
         final request = http.Request('GET', url);
         request.headers.addAll(client.headers ?? {});
         request.headers['range'] = 'bytes=$downloadedLength-';
+
+        if (downloadConfig != null) {
+          request.headers.addAll(downloadConfig.headers);
+        }
 
         final response = await client.httpClient.send(request);
 
@@ -2847,4 +2882,11 @@ class DirectoryOperationTaskResult {
     }
     return map;
   }
+}
+
+class DownloadConfig {
+  DownloadConfig(this.url, this.headers);
+
+  String url;
+  Map<String, String> headers;
 }
