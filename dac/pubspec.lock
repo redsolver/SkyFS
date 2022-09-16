@@ -409,7 +409,7 @@ packages:
     description:
       path: "."
       ref: HEAD
-      resolved-ref: "0a5e8fd756fbf447cc104469768400ee3f8067b5"
+      resolved-ref: "00a312c9884d65d659ffc1a2fb7aee112c0e445a"
       url: "https://github.com/redsolver/minio-dart.git"
     source: git
     version: "3.5.0"
