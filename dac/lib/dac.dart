@@ -1607,12 +1607,23 @@ class FileSystemDAC {
       if (remote['type'] == 's3') {
         final client = getS3Client(remoteId, remoteConfig);
 
+        await client.putBucketCors(
+          remoteConfig['bucket'],
+          '''<?xml version="1.0" encoding="UTF-8"?>
+<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+   <CORSRule>
+      <AllowedOrigin>*</AllowedOrigin>
+      <AllowedMethod>GET</AllowedMethod>
+      <AllowedMethod>HEAD</AllowedMethod>
+      <MaxAgeSeconds>86400</MaxAgeSeconds>
+      <AllowedHeader></AllowedHeader>
+   </CORSRule>
+</CORSConfiguration>''',
+        );
+
         final url = await client.presignedGetObject(
           remoteConfig['bucket'],
           'skyfs/${df.file.url.substring(scheme.length + 3)}',
-          respHeaders: {
-            'Access-Control-Allow-Origin': '*',
-          },
         );
         df.file.url = url;
       }
