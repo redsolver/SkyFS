@@ -1610,6 +1610,9 @@ class FileSystemDAC {
         final url = await client.presignedGetObject(
           remoteConfig['bucket'],
           'skyfs/${df.file.url.substring(scheme.length + 3)}',
+          respHeaders: {
+            'Access-Control-Allow-Origin': '*',
+          },
         );
         df.file.url = url;
       }
