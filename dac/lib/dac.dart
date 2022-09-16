@@ -7,6 +7,7 @@ import 'package:blurhash_dart/blurhash_dart.dart';
 // import 'package:exif/exif.dart';
 import 'package:filesystem_dac/model/utils.dart';
 import 'package:flac_metadata/flac_metadata.dart';
+import 'package:minio/minio.dart';
 import 'package:path/path.dart';
 import 'package:retry/retry.dart';
 import 'package:universal_platform/universal_platform.dart';
@@ -1551,8 +1552,9 @@ class FileSystemDAC {
 
   Future<DirectoryOperationTaskResult> copyFile(
     String sourceFilePath,
-    String targetDirectoryPath,
-  ) async {
+    String targetDirectoryPath, {
+    bool generatePresignedUrls = false,
+  }) async {
     final source = parseFilePath(sourceFilePath);
 
     final sourceFileName = source.fileName;
@@ -1583,10 +1585,48 @@ class FileSystemDAC {
         if (directoryIndex.files.containsKey(sourceFileName))
           throw 'Target directory already contains a file with the same name';
 
-        directoryIndex.files[sourceFileName] = sourceDir.files[sourceFileName]!;
+        final file = sourceDir.files[sourceFileName]!;
+        if (generatePresignedUrls) {
+          await generatePresignedUrlsForFile(file);
+        }
+        directoryIndex.files[sourceFileName] = file;
       },
     );
     return res;
+  }
+
+  Future<void> generatePresignedUrlsForFile(DirectoryFile df) async {
+    final scheme = df.file.url.split(':').first;
+    if (scheme.startsWith('remote-')) {
+      final remoteId = scheme.substring(7);
+
+      final remote = customRemotes[remoteId]!;
+
+      final remoteConfig = remote['config'] as Map;
+
+      if (remote['type'] == 's3') {
+        final client = getS3Client(remoteId, remoteConfig);
+
+        final url = await client.presignedGetObject(
+          remoteConfig['bucket'],
+          'skyfs/${df.file.url.substring(scheme.length + 3)}',
+        );
+        df.file.url = url;
+      }
+    }
+  }
+
+  final _s3ClientCache = <String, Minio>{};
+  Minio getS3Client(String remoteId, Map config) {
+    if (!_s3ClientCache.containsKey(remoteId)) {
+      _s3ClientCache[remoteId] = Minio(
+        endPoint: config['endpoint'] as String,
+        accessKey: config['accessKey'] as String,
+        secretKey: config['secretKey'] as String,
+        useSSL: true,
+      );
+    }
+    return _s3ClientCache[remoteId]!;
   }
 
   Future<DirectoryOperationTaskResult> moveFile(
