@@ -407,9 +407,11 @@ packages:
   minio:
     dependency: "direct main"
     description:
-      name: minio
-      url: "https://pub.dartlang.org"
-    source: hosted
+      path: "."
+      ref: HEAD
+      resolved-ref: "0a5e8fd756fbf447cc104469768400ee3f8067b5"
+      url: "https://github.com/redsolver/minio-dart.git"
+    source: git
     version: "3.5.0"
   package_config:
     dependency: transitive
