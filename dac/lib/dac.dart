@@ -1135,6 +1135,13 @@ class FileSystemDAC {
     return di;
   }
 
+  String _removeTrailingSlash(String s) {
+    if (s.endsWith('/')) {
+      return s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
   Future<DirectoryIndex> _getDirectoryIndexInternal(Uri parsedPath) async {
     if (parsedPath.host == 'remote') {
       final remoteId = parsedPath.userInfo.split(':').last;
@@ -1185,6 +1192,49 @@ class FileSystemDAC {
                   size: e.size ?? 0,
                   ts: e.mTime?.millisecondsSinceEpoch ?? 0,
                   url: 'remote-$remoteId:/${e.path}',
+                  padding: null,
+                ));
+          }
+        }
+        return di;
+      } else if (remote['type'] == 's3') {
+        final client = getS3Client(remoteId, remoteConfig);
+        final String bucket = remoteConfig['bucket'];
+
+        final di = DirectoryIndex(
+          directories: {},
+          files: {},
+        );
+
+        await for (final objects in client.listObjectsV2(
+          bucket,
+          prefix: parsedPath.pathSegments.isEmpty
+              ? ''
+              : parsedPath.path.substring(1) + '/',
+        )) {
+          for (final p in objects.prefixes) {
+            final name = _removeTrailingSlash(p).split('/').last;
+            di.directories[name] = DirectoryDirectory(
+              name: name,
+              created: 0,
+            );
+          }
+          for (final o in objects.objects) {
+            final name = o.key!.split('/').last;
+
+            di.files[name] = DirectoryFile(
+                name: name,
+                created: o.lastModified?.millisecondsSinceEpoch ?? 0,
+                modified: o.lastModified?.millisecondsSinceEpoch ?? 0,
+                version: 0,
+                file: FileData(
+                  chunkSize: null,
+                  encryptionType: null,
+                  hash: '0000${o.eTag}',
+                  key: null,
+                  size: o.size ?? 0,
+                  ts: o.lastModified?.millisecondsSinceEpoch ?? 0,
+                  url: 'remote-$remoteId://${o.key}',
                   padding: null,
                 ));
           }
@@ -1607,7 +1657,7 @@ class FileSystemDAC {
       if (remote['type'] == 's3') {
         final client = getS3Client(remoteId, remoteConfig);
 
-        await client.putBucketCors(
+        final res = await client.putBucketCors(
           remoteConfig['bucket'],
           '''<?xml version="1.0" encoding="UTF-8"?>
 <CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1620,6 +1670,11 @@ class FileSystemDAC {
    </CORSRule>
 </CORSConfiguration>''',
         );
+        if (res.statusCode != 200) {
+          log(
+            'Could not update CORS policy: HTTP ${res.statusCode}: ${res.body}',
+          );
+        }
 
         final url = await client.presignedGetObject(
           remoteConfig['bucket'],
