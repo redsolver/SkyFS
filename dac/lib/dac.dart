@@ -1,43 +1,34 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:blurhash_dart/blurhash_dart.dart';
-// import 'package:exif/exif.dart';
+import 'package:filesystem_dac/cache/base.dart';
+import 'package:filesystem_dac/cache/hive.dart';
+import 'package:filesystem_dac/model/cached_entry.dart';
 import 'package:filesystem_dac/model/utils.dart';
-import 'package:flac_metadata/flac_metadata.dart';
+import 'package:hive/hive.dart';
+import 'package:lib5/constants.dart';
+import 'package:lib5/lib5.dart';
+import 'package:lib5/registry.dart';
+import 'package:lib5/src/crypto/encryption/chunk.dart';
+import 'package:lib5/src/crypto/encryption/mutable.dart';
+import 'package:lib5/util.dart';
+import 'package:mime_type/mime_type.dart';
 import 'package:minio/minio.dart';
 import 'package:path/path.dart';
-import 'package:retry/retry.dart';
-import 'package:universal_platform/universal_platform.dart';
-import 'package:convert/convert.dart';
-import 'package:crypto/crypto.dart';
-import 'package:filesystem_dac/model/cached_entry.dart';
-import 'package:hive/hive.dart';
-import 'package:id3/id3.dart';
 import 'package:pool/pool.dart';
-import 'package:skynet/skynet.dart';
-import 'package:skynet/src/mysky_provider/base.dart';
-import 'package:skynet/src/skystandards/fs.dart';
-import 'package:skynet/src/mysky/encrypted_files.dart';
-import 'package:http/http.dart' as http;
-import 'package:skynet/src/mysky/io.dart' as mysky_io_impl;
-import 'package:mime_type/mime_type.dart';
-import 'package:sodium/sodium.dart' hide Box;
-import 'package:state_notifier/state_notifier.dart';
-import 'package:image/image.dart' as img;
-import 'package:pinenacl/api.dart' as pinenacl;
-import 'package:skynet/src/encode_endian/encode_endian.dart';
-import 'package:skynet/src/encode_endian/base.dart';
-import 'package:skynet/src/crypto.dart';
-import 'package:uuid/uuid.dart';
+import 'package:retry/retry.dart';
 import 'package:stash/stash_api.dart';
+import 'package:state_notifier/state_notifier.dart';
+import 'package:universal_platform/universal_platform.dart';
+import 'package:uuid/uuid.dart';
 import 'package:webdav_client/webdav_client.dart' as webdav;
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
-const maxChunkSize = 1 * 1000 * 1000; // 1 MB
+const maxChunkSize = 256 * 1024; // 256 KiB
+
+const ENCRYPTION_KEY_TWEAK = 1;
 
 // ! IMPORTANT
 // ! paths allow ALL characters excluding /
@@ -100,9 +91,9 @@ const metadataSupportedExtensions = [
   ...supportedImageExtensions,
 ];
 
-const metadataMaxFileSize = 4 * 1000 * 1000;
+// const metadataMaxFileSize = 4 * 1000 * 1000;
 
-Future<List> extractMetadata(List list) async {
+/* Future<List> extractMetadata(List list) async {
   String extension = list[0].toLowerCase();
   Uint8List bytes = list[1];
   String rootPathSeed = list[2];
@@ -308,11 +299,11 @@ Future<List> extractMetadata(List list) async {
         json.encode(ext),
       ] +
       more;
-}
+} */
 
 Map<String, String> temporaryThumbnailKeyPaths = {};
 
-String deriveThumbnailKey(Digest hash, String rootPathSeed) {
+/* String deriveThumbnailKey(Digest hash, String rootPathSeed) {
   final path =
       '${DATA_DOMAIN}/encrypted-thumbnails-1/${base64Url.encode(hash.bytes)}';
 
@@ -329,43 +320,67 @@ String deriveThumbnailKey(Digest hash, String rootPathSeed) {
   }
 
   return key;
-}
+} */
 
 typedef DirectoryOperationMethod = Future Function(
-    DirectoryIndex directoryIndex);
+  DirectoryMetadata directory,
+  Uint8List writeKey,
+);
 
 class FileSystemDAC {
-  final MySkyProvider mySkyProvider;
-  SkynetClient get client => mySkyProvider.client;
+  final HiddenDBProvider hiddenDB;
+  final S5APIProvider api;
+  CryptoImplementation get crypto => api.crypto;
+
+  late final DirectoryMetadataCache dirCache;
+
+  // TODO Clear
+  final Uint8List fsRootKey;
+
   late final String skapp;
 
-  late Sodium sodium;
   late final bool rootAccessEnabled;
 
-  late final Box<CachedEntry> directoryIndexCache;
-  late final Box<String> deletedSkylinks;
+  late final Box<Uint8List> deletedSkylinks;
   // late final LazyBox<Uint8List> thumbnailCache;
   late final Cache<Uint8List> thumbnailCache;
 
-  final _fileStateChangeNotifiers = <String, FileStateNotifier>{};
+  final _fileStateChangeNotifiers = <Multihash, FileStateNotifier>{};
   final _directoryIndexChangeNotifiers =
-      <String, DirectoryIndexChangeNotifier>{};
+      <Multihash, DirectoryMetadataChangeNotifier>{};
 
   final _uploadingFilesChangeNotifiers =
       <String, UploadingFilesChangeNotifier>{};
 
   final bool debugEnabled;
 
+  late Uint8List thumbnailRootSeed;
+  late Uint8List filesystemRootKey;
+
   FileSystemDAC({
-    required this.mySkyProvider,
+    required this.api,
+    required this.hiddenDB,
     required this.skapp,
-    required this.sodium,
+    required this.fsRootKey,
     this.onLog,
     this.debugEnabled = false,
     required this.thumbnailCache,
   });
 
-  FileStateNotifier getFileStateChangeNotifier(String hash) {
+  Future<void> initSeed() async {
+    filesystemRootKey = deriveHashBlake3Int(
+      fsRootKey,
+      1,
+      crypto: crypto,
+    );
+    thumbnailRootSeed = deriveHashBlake3Int(
+      fsRootKey,
+      2,
+      crypto: crypto,
+    );
+  }
+
+  FileStateNotifier getFileStateChangeNotifier(Multihash hash) {
     // TODO Use a cross-process implementation (Not Hive)
     // TODO Permission limits when exposing to web
     if (!_fileStateChangeNotifiers.containsKey(hash)) {
@@ -374,8 +389,8 @@ class FileSystemDAC {
     return _fileStateChangeNotifiers[hash]!;
   }
 
-  DirectoryIndexChangeNotifier getDirectoryIndexChangeNotifier(
-    String uriHash, {
+  DirectoryMetadataChangeNotifier getDirectoryMetadataChangeNotifier(
+    Multihash uriHash, {
     String? path, // TODO Require this when exposed to web
   }) {
     if (path != null) {
@@ -386,7 +401,8 @@ class FileSystemDAC {
       );
     }
     if (!_directoryIndexChangeNotifiers.containsKey(uriHash)) {
-      _directoryIndexChangeNotifiers[uriHash] = DirectoryIndexChangeNotifier();
+      _directoryIndexChangeNotifiers[uriHash] =
+          DirectoryMetadataChangeNotifier();
     }
     return _directoryIndexChangeNotifiers[uriHash]!;
   }
@@ -419,50 +435,46 @@ class FileSystemDAC {
       'dev': devEnabled,
     };
 
-    await mySkyProvider.load(
+    // TODO Enable for web
+    /* await mySkyProvider.load(
       DATA_DOMAIN,
       options: opts,
-    );
-
-    Hive.registerAdapter(CachedEntryAdapter());
+    ); */
 
     if (UniversalPlatform.isWeb) {
       if (inMemoryOnly) {
-        directoryIndexCache = await Hive.openBox<CachedEntry>(
-          'fs-dac-directory-index-cache',
+        dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
+          's5fs-directory-metadata-cache',
           bytes: Uint8List(0),
-        );
+        ));
 
-        deletedSkylinks = await Hive.openBox<String>(
-          'skyfs-skylinks-to-unpin',
+        deletedSkylinks = await Hive.openBox<Uint8List>(
+          's5fs-cids-to-unpin',
           bytes: Uint8List(0),
         );
       } else {
-        directoryIndexCache = await Hive.openBox<CachedEntry>(
+        // TODO Implement
+        throw UnimplementedError();
+        /*  directoryIndexCache = await Hive.openBox<CachedEntry>(
           'fs-dac-directory-index-cache',
-        );
+        ); */
 
-        deletedSkylinks = await Hive.openBox<String>(
-          'skyfs-skylinks-to-unpin',
-        );
       }
     } else {
-      directoryIndexCache = await Hive.openBox<CachedEntry>(
-        'fs-dac-directory-index-cache',
-      );
+      dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
+        's5fs-directory-metadata-cache',
+      ));
 
-      deletedSkylinks = await Hive.openBox<String>(
-        'skyfs-skylinks-to-unpin',
+      deletedSkylinks = await Hive.openBox<Uint8List>(
+        's5fs-cids-to-unpin',
       );
-    }
-
-    if (await Hive.boxExists('fs-dac-thumbnail-cache')) {
-      Hive.deleteBoxFromDisk('fs-dac-thumbnail-cache');
     }
   }
 
   Future<void> onUserLogin() async {
     log('onUserLogin');
+
+    await initSeed();
 
     loadMounts();
 
@@ -479,28 +491,75 @@ class FileSystemDAC {
     log('createRootDirectory $skapp [skapp: $skapp]');
 
     await doOperationOnDirectory(
-      Uri.parse('skyfs://local/fs-dac.hns'),
-      (directoryIndex) async {
+      Uri.parse('skyfs://root'),
+      (directoryIndex, writeKey) async {
         bool doUpdate = false;
 
         if (!directoryIndex.directories.containsKey('home')) {
-          directoryIndex.directories['home'] = DirectoryDirectory(
-            created: nowTimestamp(),
-            name: 'home',
-          );
+          directoryIndex.directories['home'] =
+              await _createDirectory('home', writeKey);
+
           doUpdate = true;
         }
 
         if (!directoryIndex.directories.containsKey(skapp)) {
-          directoryIndex.directories[skapp] = DirectoryDirectory(
-            created: nowTimestamp(),
-            name: skapp,
-          );
+          directoryIndex.directories[skapp] =
+              await _createDirectory(skapp, writeKey);
+          doUpdate = true;
+        }
+
+        if (!directoryIndex.directories.containsKey('vup.hns')) {
+          directoryIndex.directories['vup.hns'] =
+              await _createDirectory('vup.hns', writeKey);
           doUpdate = true;
         }
 
         return doUpdate;
       },
+    );
+
+    doOperationOnDirectory(
+      Uri.parse('skyfs://root/vup.hns'),
+      (directoryIndex, writeKey) async {
+        bool doUpdate = false;
+
+        if (!directoryIndex.directories
+            .containsKey('shared-static-directories')) {
+          directoryIndex.directories['shared-static-directories'] =
+              await _createDirectory('shared-static-directories', writeKey);
+          doUpdate = true;
+        }
+        if (!directoryIndex.directories.containsKey('shared-with-me')) {
+          directoryIndex.directories['shared-with-me'] =
+              await _createDirectory('shared-with-me', writeKey);
+          doUpdate = true;
+        }
+
+        return doUpdate;
+      },
+    );
+  }
+
+  Future<DirectoryReference> _createDirectory(
+      String name, Uint8List writeKey) async {
+    final newWriteKey = crypto.generateRandomBytes(32);
+
+    final keys = await deriveKeysFromWriteKey(newWriteKey);
+
+    final nonce = crypto.generateRandomBytes(24);
+
+    final encryptedWriteKey = await crypto.encryptXChaCha20Poly1305(
+      key: writeKey,
+      nonce: nonce,
+      plaintext: newWriteKey,
+    );
+
+    return DirectoryReference(
+      created: nowTimestamp(),
+      name: name,
+      encryptedWriteKey: Uint8List.fromList([0x01] + nonce + encryptedWriteKey),
+      publicKey: keys.keyPair.publicKey,
+      encryptionKey: keys.encryptionKey,
     );
   }
 
@@ -510,16 +569,15 @@ class FileSystemDAC {
     if (path.startsWith('skyfs://')) {
       uri = Uri.parse(path);
     } else {
-      final list = [DATA_DOMAIN] +
-          path
-              .split('/')
-              .map((e) => e.trim())
-              .where((element) => element.isNotEmpty)
-              .toList();
+      final list = path
+          .split('/')
+          .map((e) => e.trim())
+          .where((element) => element.isNotEmpty)
+          .toList();
 
       uri = Uri(
         scheme: 'skyfs',
-        host: 'local',
+        host: 'root',
         pathSegments: list,
       );
     }
@@ -546,12 +604,13 @@ class FileSystemDAC {
 
   final _mountsPath = 'fs-dac.hns/fs-dac.hns/mounts.json';
 
-  late DataWithRevision<dynamic> _lastMountsResponse;
+  late HiddenJSONResponse _lastMountsResponse;
 
   var mounts = <String, Map>{};
 
   Future<void> loadMounts() async {
-    log('> loadMounts');
+    // TODO Implement
+    /*  log('> loadMounts');
     try {
       _lastMountsResponse = await mySkyProvider.getJSONEncrypted(
         _mountsPath,
@@ -573,11 +632,12 @@ class FileSystemDAC {
         mounts = json.decode(cached.data).cast<String, Map>();
       }
     }
-    log('< loadMounts');
+    log('< loadMounts'); */
   }
 
   Future<void> saveMounts() async {
-    log('> saveMounts');
+    // TODO Implement
+/*     log('> saveMounts');
     await mySkyProvider.setJSONEncrypted(
       _mountsPath,
       mounts,
@@ -593,7 +653,7 @@ class FileSystemDAC {
         skylink: null, // TODO Store skylink
       ),
     );
-    log('< saveMounts');
+    log('< saveMounts'); */
   }
 
   Future<void> mountUri(
@@ -683,14 +743,16 @@ class FileSystemDAC {
 
   final _remotesPath = 'fs-dac.hns/fs-dac.hns/remotes.json';
 
-  late DataWithRevision<dynamic> _lastRemotesResponse;
+  late HiddenJSONResponse _lastRemotesResponse;
 
   var customRemotes = <String, Map>{};
 
   final _webDavClientCache = <String, webdav.Client>{};
 
   Future<void> loadRemotes() async {
-    log('> loadRemotes');
+    // TODO Implement
+    return;
+/*     log('> loadRemotes');
     try {
       _lastRemotesResponse = await mySkyProvider.getJSONEncrypted(
         _remotesPath,
@@ -712,11 +774,13 @@ class FileSystemDAC {
         customRemotes = json.decode(cached.data).cast<String, Map>();
       }
     }
-    log('< loadRemotes');
+    log('< loadRemotes'); */
   }
 
   Future<void> saveRemotes() async {
-    log('> saveRemotes');
+    // TODO Implement
+
+    /*    log('> saveRemotes');
     await mySkyProvider.setJSONEncrypted(
       _remotesPath,
       customRemotes,
@@ -732,13 +796,27 @@ class FileSystemDAC {
         skylink: null, // TODO Store skylink
       ),
     );
-    log('< saveRemotes');
+    log('< saveRemotes'); */
   }
 
-  void setFileState(String hash, FileState state) {
+  void setFileState(Multihash hash, FileState state) {
     // log('setFileState $hash $state');
     // runningTasks
     getFileStateChangeNotifier(hash).updateFileState(state);
+  }
+
+  void setDirectoryState(String path, FileState state) {
+    getDirectoryStateChangeNotifier(path).updateFileState(state);
+  }
+
+  FileStateNotifier getDirectoryStateChangeNotifier(String path) {
+    return getFileStateChangeNotifier(
+      Multihash(
+        crypto.hashBlake3Sync(
+          Uint8List.fromList(utf8.encode(path)),
+        ),
+      ),
+    );
   }
 
   // TODO minimum delay of 200 milliseconds
@@ -782,14 +860,17 @@ class FileSystemDAC {
     Uri uri,
   ) async {
     final uriHash = convertUriToHashForCache(uri);
-    final res = await getJsonEncryptedWithUri(uri, uriHash);
+    final res = await getDirectoryMetadataWithUri(uri, uriHash);
 
-    final directoryIndex = res.data != null
-        ? DirectoryIndex.fromJson(res.data)
-        : DirectoryIndex(
-            directories: {},
-            files: {},
-          );
+    final directoryIndex = res
+        .data; /* ??
+        DirectoryMetadata(
+          details: DirectoryMetadataDetails({}),
+          directories: {},
+          files: {},
+          extraMetadata: ExtraMetadata({}),
+        ) */
+
     if (!UniversalPlatform.isWeb) {
       populateUris(uri, directoryIndex);
     }
@@ -801,14 +882,14 @@ class FileSystemDAC {
       tasks.add(op);
     }
 
-    bool doUpdate = false;
+    var doUpdate = false;
 
     log('[dirIndex] process ${tasks.length} tasks');
 
     for (final task in tasks) {
       try {
-        final res = await task.operation(directoryIndex);
-        if (res != false) {
+        final r = await task.operation(directoryIndex, res.writeKey!);
+        if (r != false) {
           doUpdate = true;
         }
       } catch (e) {
@@ -822,23 +903,38 @@ class FileSystemDAC {
     }
     log('doUpdate $doUpdate');
 
-    String? newSkylink;
+    CID? newCID;
 
     var result = DirectoryOperationTaskResult(true);
     if (doUpdate) {
-      if (uri.host == 'local') {
-        // TODO Retry when an error happens here
-        final newRes = await mySkyProvider.setJSONEncrypted(
-          uriPathToMySkyPath(uri.pathSegments),
-          directoryIndex,
-          res.revision + 1,
+      final cipherText = await encryptMutableBytes(
+        directoryIndex.serialize(),
+        res.encryptionKey!,
+        crypto: crypto,
+      );
+
+      final cid = await api.uploadRawFile(cipherText);
+
+      if (uri.host == 'root') {
+        final kp = await crypto.newKeyPairEd25519(seed: res.secretKey!);
+
+        final sre = await signRegistryEntry(
+          kp: kp,
+          data: cid.toRegistryEntry(),
+          revision: res.revision + 1,
+          crypto: crypto,
         );
 
-        newSkylink = newRes.skylink;
+        await api.registrySet(sre);
+
+        // TODO Check updated
+
+        newCID = cid;
 
         result = DirectoryOperationTaskResult(true);
       } else {
-        final userInfo = uri.userInfo;
+        throw UnimplementedError();
+        /*  final userInfo = uri.userInfo;
 
         final skynetUser = await _getSkynetUser(userInfo);
         final path = [...uri.pathSegments, 'index.json'].join('/');
@@ -853,10 +949,10 @@ class FileSystemDAC {
 
         newSkylink = newRes.skylink;
 
-        result = DirectoryOperationTaskResult(true);
+        result = DirectoryOperationTaskResult(true); */
       }
-      if (res.skylink != null) {
-        deletedSkylinks.add(res.skylink!);
+      if (res.cid != null) {
+        deletedSkylinks.add(res.cid!.toBytes());
       }
     }
     for (final task in tasks) {
@@ -865,20 +961,20 @@ class FileSystemDAC {
       }
     }
 
-    if (uri.path == '/' + DATA_DOMAIN) return;
-    if (doUpdate) {
-      getDirectoryIndexChangeNotifier(
-        uriHash,
-      ).updateDirectoryIndex(directoryIndex);
+    // TODO Why?
+    if (uri.pathSegments.isEmpty) return;
 
-      directoryIndexCache.put(
+    if (doUpdate) {
+      getDirectoryMetadataChangeNotifier(
         uriHash,
-        CachedEntry(
+      ).updateDirectoryMetadata(directoryIndex);
+
+      dirCache.set(
+        uriHash,
+        CachedDirectoryMetadata(
+          data: directoryIndex,
           revision: res.revision + 1,
-          data: json.encode(
-            directoryIndex,
-          ),
-          skylink: newSkylink,
+          cid: newCID!,
         ),
       );
     }
@@ -905,7 +1001,7 @@ class FileSystemDAC {
     return false;
   }
 
-  Future<DirectoryIndex> getAllFiles({
+  Future<DirectoryMetadata> getAllFiles({
     String startDirectory = '',
     required bool includeFiles,
     required bool includeDirectories,
@@ -919,13 +1015,15 @@ class FileSystemDAC {
       throw 'Permission denied';
     } */
 
-    final result = DirectoryIndex(
+    final result = DirectoryMetadata(
+      details: DirectoryMetadataDetails({}),
       directories: {},
       files: {},
+      extraMetadata: ExtraMetadata({}),
     );
     Future<void> processDirectory(String path) async {
       final dir =
-          getDirectoryIndexCached(path) ?? await getDirectoryIndex(path);
+          getDirectoryMetadataCached(path) ?? await getDirectoryMetadata(path);
 
       // print('processDirectory $path ${dir.files.keys.length}');
 
@@ -956,28 +1054,25 @@ class FileSystemDAC {
     bool read = true,
     bool write = true,
   }) {
-    if (uri.host == 'local') {
+    if (uri.host == 'root') {
       if (rootAccessEnabled) {
-        if (uri.pathSegments.length > 1 && uri.pathSegments[1] == DATA_DOMAIN) {
-          if (write) {
-            throw 'Writing to internal paths is forbidden';
-          }
-          return;
-        } else {
-          return;
-        }
+        return;
       }
 
-      if (uri.pathSegments.length < 2) {
+      if (uri.pathSegments.length < 1) {
         throw 'Access denied, path too short';
       }
 
-      if (uri.pathSegments[0] != DATA_DOMAIN) {
+      /* if (uri.pathSegments[0] != DATA_DOMAIN) {
         throw 'Internal permission error';
-      }
+      } */
 
-      if (uri.pathSegments[1] != skapp) {
+      if (uri.pathSegments[0] != skapp) {
         throw 'Access denied.';
+      }
+    } else if (uri.host == 'shared-readonly') {
+      if (write) {
+        throw 'Can\'t write to read-only shared directories or files';
       }
     } else {
       if (uri.userInfo.startsWith('r:') || uri.host == 'remote') {
@@ -995,35 +1090,31 @@ class FileSystemDAC {
     return DateTime.now().millisecondsSinceEpoch;
   }
 
-  String convertUriToHashForCache(Uri uri) {
-    return base64Url.encode(sha1.convert(utf8.encode(uri.toString())).bytes);
+  Multihash convertUriToHashForCache(Uri uri) {
+    return Multihash(Uint8List.fromList(
+      [mhashBlake3Default] +
+          crypto.hashBlake3Sync(
+              (Uint8List.fromList(utf8.encode(uri.toString())))),
+    ));
   }
 
-  DirectoryIndex? getDirectoryIndexCached(String rawPath) {
+  DirectoryMetadata? getDirectoryMetadataCached(String rawPath) {
     final uri = parsePath(rawPath);
     final uriHash = convertUriToHashForCache(uri);
     // TODO Permission checks
 
-    if (directoryIndexCache.containsKey(uriHash)) {
-      final cachedEntry = directoryIndexCache.get(uriHash)!;
-
-      late final DirectoryIndex index;
-      if (cachedEntry.data != 'null') {
-        index = DirectoryIndex.fromJson(
-            json.decode(cachedEntry.data).cast<String, dynamic>());
-      } else {
-        index = DirectoryIndex(directories: {}, files: {});
-      }
+    if (dirCache.has(uriHash)) {
+      final cachedDir = dirCache.get(uriHash)!.data;
 
       if (!UniversalPlatform.isWeb) {
-        populateUris(uri, index);
+        populateUris(uri, cachedDir);
       }
 
-      return index;
+      return cachedDir;
     }
   }
 
-  void populateUris(Uri currentUri, DirectoryIndex di) {
+  void populateUris(Uri currentUri, DirectoryMetadata di) {
     for (final key in di.files.keys) {
       di.files[key]!.key = key;
 
@@ -1041,9 +1132,9 @@ class FileSystemDAC {
     }
   }
 
-  Future<DirectoryIndex> getDirectoryIndex(String path) async {
+  Future<DirectoryMetadata> getDirectoryMetadata(String path) async {
     final parsedPath = parsePath(path);
-    log('getDirectoryIndex $parsedPath');
+    log('getDirectoryMetadata $parsedPath');
 
     validateAccess(
       parsedPath,
@@ -1051,7 +1142,7 @@ class FileSystemDAC {
       write: false,
     );
 
-    late DirectoryIndex di;
+    late DirectoryMetadata di;
 
     if (parsedPath.queryParameters.containsKey('recursive')) {
       final type = parsedPath.queryParameters['type'] ?? '*';
@@ -1066,7 +1157,7 @@ class FileSystemDAC {
         includeDirectories: type != 'file',
       );
     } else {
-      di = await _getDirectoryIndexInternal(parsedPath);
+      di = await _getDirectoryMetadataInternal(parsedPath);
     }
 
     if (parsedPath.queryParameters.isNotEmpty) {
@@ -1142,7 +1233,101 @@ class FileSystemDAC {
     return s;
   }
 
-  Future<DirectoryIndex> _getDirectoryIndexInternal(Uri parsedPath) async {
+  final privateKeyCache = <Uri, Uint8List>{};
+
+  Future<Uint8List> getPrivateKeyForDirectory(Uri uri) async {
+    if (uri.host != 'root') {
+      throw 'Unsupported URI (host)';
+    }
+    if (privateKeyCache.containsKey(uri)) {
+      return privateKeyCache[uri]!;
+    }
+
+    if (uri.pathSegments.isEmpty) {
+      return filesystemRootKey;
+    }
+
+    final parentUri = uri.replace(
+      pathSegments: uri.pathSegments.sublist(0, uri.pathSegments.length - 1),
+    );
+
+    final parentKeyBytes = await getPrivateKeyForDirectory(parentUri);
+    final parentDir = await _getDirectoryMetadataInternal(parentUri);
+
+    if (!parentDir.directories.containsKey(uri.pathSegments.last)) {
+      throw 'Directory $uri does not exist';
+    }
+
+    final encryptedWriteKey =
+        parentDir.directories[uri.pathSegments.last]!.encryptedWriteKey;
+
+    if (encryptedWriteKey[0] != 0x01) {
+      throw 'Unsupported encryption algorithm';
+    }
+
+    final nonce = encryptedWriteKey.sublist(1, 25);
+
+    final key = await crypto.decryptXChaCha20Poly1305(
+      ciphertext: encryptedWriteKey.sublist(25),
+      nonce: nonce,
+      key: parentKeyBytes,
+    );
+
+    privateKeyCache[uri] = key;
+
+    return key;
+  }
+
+  final sharedReadKeyCache = <Uri, List<Uint8List?>>{};
+
+  Future<List<Uint8List?>> getReadKeysForDirectory(Uri uri) async {
+    if (uri.host != 'shared-readonly') {
+      throw 'Unsupported URI (host)';
+    }
+    if (sharedReadKeyCache.containsKey(uri)) {
+      return sharedReadKeyCache[uri]!;
+    }
+
+    if (uri.pathSegments.isEmpty) {
+      final parts = uri.userInfo.split(':');
+      return [
+        base64UrlNoPaddingDecode(parts[0]),
+        base64UrlNoPaddingDecode(parts[1]),
+      ];
+    }
+
+    final parentUri = uri.replace(
+      pathSegments: uri.pathSegments.sublist(0, uri.pathSegments.length - 1),
+    );
+
+    final parentDir = await _getDirectoryMetadataInternal(parentUri);
+
+    if (!parentDir.directories.containsKey(uri.pathSegments.last)) {
+      throw 'Directory $uri does not exist';
+    }
+
+    final dir = parentDir.directories[uri.pathSegments.last]!;
+    final keys = [dir.publicKey, dir.encryptionKey];
+
+    sharedReadKeyCache[uri] = keys;
+
+    return keys;
+  }
+
+  Future<KeyResponse> deriveKeysFromWriteKey(Uint8List writeKey) async {
+    // TODO Cache
+    final keyPair = await crypto.newKeyPairEd25519(seed: writeKey);
+    final encryptionKey = deriveHashBlake3Int(
+      writeKey,
+      ENCRYPTION_KEY_TWEAK,
+      crypto: crypto,
+    );
+
+    return KeyResponse(keyPair: keyPair, encryptionKey: encryptionKey);
+  }
+
+  Future<DirectoryMetadata> _getDirectoryMetadataInternal(
+      Uri parsedPath) async {
     if (parsedPath.host == 'remote') {
       final remoteId = parsedPath.userInfo.split(':').last;
       if (!customRemotes.containsKey(remoteId)) {
@@ -1152,7 +1337,7 @@ class FileSystemDAC {
 
       final Map remoteConfig = remote['config'] as Map;
 
-      if (remote['type'] == 'webdav') {
+      /*  if (remote['type'] == 'webdav') {
         if (!_webDavClientCache.containsKey(remoteId)) {
           _webDavClientCache[remoteId] = webdav.newClient(
             remoteConfig['url'] as String,
@@ -1163,7 +1348,7 @@ class FileSystemDAC {
         }
         final webDavClient = _webDavClientCache[remoteId]!;
         final res = await webDavClient.readDir(parsedPath.path);
-        final di = DirectoryIndex(
+        final di = DirectoryMetadata(
           directories: {},
           files: {},
         );
@@ -1201,7 +1386,7 @@ class FileSystemDAC {
         final client = getS3Client(remoteId, remoteConfig);
         final String bucket = remoteConfig['bucket'];
 
-        final di = DirectoryIndex(
+        final di = DirectoryMetadata(
           directories: {},
           files: {},
         );
@@ -1239,15 +1424,15 @@ class FileSystemDAC {
                 ));
           }
         }
-        return di;
-      } else {
-        throw 'Remote type ${remote['type']} not supported';
-      }
+        return di; */
+      /* } else { */
+      throw 'Remote type ${remote['type']} not supported';
+      /* } */
     }
 
     final uriHash = convertUriToHashForCache(parsedPath);
 
-    log('getDirectoryIndex $parsedPath');
+    log('getDirectoryMetadata $parsedPath');
 
     if (parsedPath.toString().startsWith(
           'skyfs://local/fs-dac.hns/fs-dac.hns/index/all',
@@ -1260,7 +1445,7 @@ class FileSystemDAC {
             .startsWith('skyfs://local/fs-dac.hns/fs-dac.hns/index/all-files'),
       );
 
-      getDirectoryIndexChangeNotifier(uriHash).updateDirectoryIndex(di);
+      getDirectoryMetadataChangeNotifier(uriHash).updateDirectoryMetadata(di);
       return di;
     }
 
@@ -1269,57 +1454,55 @@ class FileSystemDAC {
 
     var hasUpdate = false;
 
-    final res = await getJsonEncryptedWithUri(
+    final res = await getDirectoryMetadataWithUri(
       parsedPath,
       uriHash,
     );
 
-    if (directoryIndexCache.containsKey(uriHash)) {
-      final existing = directoryIndexCache.get(uriHash)!;
+    if (dirCache.has(uriHash)) {
+      final existing = dirCache.get(uriHash)!;
       if (existing.revision < res.revision) {
-        await directoryIndexCache.put(
+        dirCache.set(
           uriHash,
-          CachedEntry(
-            data: json.encode(res.data),
+          CachedDirectoryMetadata(
+            data: res.data,
             revision: res.revision,
-            skylink: res.skylink,
+            cid: res.cid,
           ),
         );
         hasUpdate = true;
       }
     } else {
-      await directoryIndexCache.put(
+      dirCache.set(
         uriHash,
-        CachedEntry(
-          data: json.encode(res.data),
+        CachedDirectoryMetadata(
+          data: res.data,
           revision: res.revision,
-          skylink: res.skylink,
+          cid: res.cid,
         ),
       );
+
       hasUpdate = true;
     }
     revision = res.revision;
-    if (res.data != null) {
+    /* if (res.data != null) {
       data = res.data as Map<String, dynamic>;
-    }
+    } */
 
-    if (revision == -1 || data == null) {
-      final index = DirectoryIndex(
-        directories: {},
-        files: {},
-      );
-      if (hasUpdate) {
-        getDirectoryIndexChangeNotifier(uriHash).updateDirectoryIndex(index);
-      }
-      return index;
+    // if (revision == -1 || data == null) {
+    if (hasUpdate) {
+      getDirectoryMetadataChangeNotifier(uriHash)
+          .updateDirectoryMetadata(res.data);
     }
-    final directoryIndex = DirectoryIndex.fromJson(data);
+    return res.data;
+    /*   }
+    final directoryIndex = DirectoryMetadata.fromJson(data);
 
     if (hasUpdate) {
-      getDirectoryIndexChangeNotifier(uriHash)
-          .updateDirectoryIndex(directoryIndex);
+      getDirectoryMetadataChangeNotifier(uriHash)
+          .updateDirectoryMetadata(directoryIndex);
     }
-    return directoryIndex;
+    return directoryIndex; */
   }
 
   Future<int> calculateRecursiveDirectorySize(String path) async {
@@ -1329,7 +1512,9 @@ class FileSystemDAC {
       includeDirectories: false,
     );
     return di.files.values.fold<int>(
-        0, (previousValue, element) => previousValue + element.file.size);
+      0,
+      (previousValue, element) => previousValue + (element.file.cid.size ?? 0),
+    );
   }
 
   Future<DirectoryOperationTaskResult> createDirectory(
@@ -1348,14 +1533,12 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       uri,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (directoryIndex.directories.containsKey(name))
           throw 'Directory already contains a subdirectory with the same name';
 
-        directoryIndex.directories[name] = DirectoryDirectory(
-          created: nowTimestamp(),
-          name: name,
-        );
+        directoryIndex.directories[name] =
+            await _createDirectory(name, writeKey);
       },
     );
 
@@ -1366,7 +1549,9 @@ class FileSystemDAC {
     String path,
     String name,
   ) async {
-    final uri = parsePath(path);
+    throw 'Operation not supported yet';
+
+/*     final uri = parsePath(path);
     final dirUri = uri.replace(
       path: uri.path + '/$name',
     );
@@ -1388,30 +1573,32 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       dirUri,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (directoryIndex.directories.isNotEmpty)
           throw 'Directory still contains subdirectories';
         if (directoryIndex.files.isNotEmpty)
           throw 'Directory still contains files';
-        directoryIndex = DirectoryIndex(directories: {}, files: {});
+        // TODO Improve delete
+        directoryIndex = DirectoryMetadata(directories: {}, files: {});
       },
     );
     if (!res.success) return res;
 
     final res2 = await doOperationOnDirectory(
       uri,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         directoryIndex.directories.remove(name);
       },
     );
 
-    return res2;
+    return res2; */
   }
 
   Future<DirectoryOperationTaskResult> deleteDirectoryRecursive(
     String path, {
     bool unpinEverything = false,
   }) async {
+    throw UnimplementedError();
     final uri = parsePath(path);
 
     validateAccess(
@@ -1424,7 +1611,7 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       uri,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         for (final name in directoryIndex.directories.keys) {
           final res = await deleteDirectoryRecursive(
             getChildUri(uri, name).toString(),
@@ -1460,15 +1647,16 @@ class FileSystemDAC {
     return DirectoryOperationTaskResult(true);
   }
 
-  void deleteFileSkylinks(DirectoryFile file) {
-    for (final url in [
-      file.file.url,
-      ...(file.history?.values.map((e) => e.url).toList() ?? [])
+  void deleteFileSkylinks(FileReference file) {
+    for (final cid in <CID>[
+      file.file.cid,
+      ...(file.history?.values.map((e) => e.cid).toList() ?? [])
     ]) {
-      deletedSkylinks.add(url);
+      deletedSkylinks.add(cid.toBytes());
     }
 
-    for (final key in [
+    // TODO Delete thumbnails
+    /* for (final key in [
       file.ext?['audio']?['coverKey'],
       file.ext?['video']?['coverKey'],
       file.ext?['thumbnail']?['key'],
@@ -1476,10 +1664,10 @@ class FileSystemDAC {
       if (key != null) {
         deletedSkylinks.add(key);
       }
-    }
+    } */
   }
 
-  Future<SkynetUser> _getSkynetUser(String userInfo) async {
+/*   Future<SkynetUser> _getSkynetUser(String userInfo) async {
     if (!skynetUserCache.containsKey(userInfo)) {
       final mySkySeed = base64Url.decode(
         userInfo.substring(3),
@@ -1488,7 +1676,7 @@ class FileSystemDAC {
       skynetUserCache[userInfo] = user;
     }
     return skynetUserCache[userInfo]!; // TODO Error handling
-  }
+  } */
 
   Future<String> getShareUriReadOnly(String path) async {
     final uri = parsePath(path);
@@ -1498,6 +1686,22 @@ class FileSystemDAC {
       read: true,
       write: false,
     );
+
+    if (uri.host == 'root') {
+      final writeKey = await getPrivateKeyForDirectory(uri);
+
+      final keys = await deriveKeysFromWriteKey(writeKey);
+      final publicKey = keys.keyPair.publicKey;
+      final encryptionKey = keys.encryptionKey;
+
+      return 'skyfs://${base64UrlNoPaddingEncode(publicKey)}:${base64UrlNoPaddingEncode(encryptionKey)}@shared-readonly';
+    } else if (uri.host == 'shared-readonly') {
+      return uri.toString();
+    } else {
+      throw 'Sharing already shared URIs is not supported yet';
+    }
+
+    /* 
 
     if (uri.host != 'local') {
       final userInfo = uri.userInfo;
@@ -1524,18 +1728,18 @@ class FileSystemDAC {
         uri.pathSegments.join('/'), true);
     log('getShareUriReadOnly -> ${pathSeed.length} $pathSeed');
 
-    return 'skyfs://r:${base64Url.encode(hex.decode(pathSeed))}@${await mySkyProvider.userId()}';
+    return 'skyfs://r:${base64Url.encode(hex.decode(pathSeed))}@${await mySkyProvider.userId()}'; */
   }
 
   // TODO Better method name
   Future<String> generateSharedReadWriteDirectory() async {
-    final seed = pinenacl.PineNaClUtils.randombytes(16);
+    final seed = crypto.generateRandomBytes(16);
 
     return 'skyfs://rw:${base64Url.encode(seed)}@shared';
   }
 
   Future<DirectoryOperationTaskResult> createFile(
-      String directoryPath, String name, FileData fileData,
+      String directoryPath, String name, FileVersion fileData,
       {String? customMimeType}) async {
     final path = parsePath(directoryPath);
 
@@ -1549,15 +1753,15 @@ class FileSystemDAC {
 
     log('createFile $path $name [skapp: $skapp]');
 
-    DirectoryFile? createdFile;
+    FileReference? createdFile;
 
     final res = await doOperationOnDirectory(
       path,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (directoryIndex.files.containsKey(name))
           throw 'Directory already contains a file with the same name';
 
-        final file = DirectoryFile(
+        final file = FileReference(
           created: fileData.ts,
           modified: fileData.ts,
           name: name,
@@ -1624,28 +1828,28 @@ class FileSystemDAC {
     );
 
     log('copyFile $sourceFileName from $sourceDirectory to $targetDirectory [skapp: $skapp]');
-    final sourceDir = await getDirectoryIndex(source.directoryPath);
+    final sourceDir = await getDirectoryMetadata(source.directoryPath);
     if (!sourceDir.files.containsKey(sourceFileName)) {
       throw 'Source file does not exist.';
     }
 
     final res = await doOperationOnDirectory(
       targetDirectory,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (directoryIndex.files.containsKey(sourceFileName))
           throw 'Target directory already contains a file with the same name';
 
         final file = sourceDir.files[sourceFileName]!;
-        if (generatePresignedUrls) {
+        /*   if (generatePresignedUrls) {
           await generatePresignedUrlsForFile(file);
-        }
+        } */
         directoryIndex.files[sourceFileName] = file;
       },
     );
     return res;
   }
 
-  Future<void> generatePresignedUrlsForFile(DirectoryFile df) async {
+/*   Future<void> generatePresignedUrlsForFile(DirectoryReference df) async {
     final scheme = df.file.url.split(':').first;
     if (scheme.startsWith('remote-')) {
       final remoteId = scheme.substring(7);
@@ -1683,7 +1887,7 @@ class FileSystemDAC {
         df.file.url = url;
       }
     }
-  }
+  } */
 
   final _s3ClientCache = <String, Minio>{};
   Minio getS3Client(String remoteId, Map config) {
@@ -1727,13 +1931,13 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       sourceDirectory,
-      (sourceDirIndex) async {
+      (sourceDirIndex, writeKey) async {
         if (!sourceDirIndex.files.containsKey(source.fileName))
           throw 'Source file does not exist.';
 
         final res = await doOperationOnDirectory(
           targetDirectory,
-          (targetDirIndex) async {
+          (targetDirIndex, writeKey) async {
             if (!generateRandomKey) {
               if (targetDirIndex.files.containsKey(target.fileName))
                 throw 'Target directory already contains a file with the same name';
@@ -1774,7 +1978,7 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       directory,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (!directoryIndex.files.containsKey(file.fileName))
           throw 'Source file does not exist.';
 
@@ -1807,7 +2011,7 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       directory,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (!directoryIndex.files.containsKey(file.fileName))
           throw 'Source file does not exist.';
 
@@ -1836,6 +2040,7 @@ class FileSystemDAC {
     String targetDirectoryPath, {
     bool recursive = true,
   }) async {
+    throw UnimplementedError();
     final sourceDirectory = parsePath(sourceDirectoryPath);
     final targetDirectory = parsePath(targetDirectoryPath);
 
@@ -1853,11 +2058,11 @@ class FileSystemDAC {
 
     log('cloneDirectory $sourceDirectory to $targetDirectory [skapp: $skapp]');
 
-    final sourceDir = await getDirectoryIndex(sourceDirectoryPath);
+    final sourceDir = await getDirectoryMetadata(sourceDirectoryPath);
     // log('cloneDirectory source index: ${json.encode(sourceDir)}');
     final res = await doOperationOnDirectory(
       targetDirectory,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         directoryIndex.directories = sourceDir.directories;
         directoryIndex.files = sourceDir.files;
       },
@@ -1887,6 +2092,8 @@ class FileSystemDAC {
     String sourceDirectoryPath,
     String targetDirectoryPath,
   ) async {
+    throw UnimplementedError();
+
     final sourceDirectory = parsePath(sourceDirectoryPath);
     final targetDirectory = parsePath(targetDirectoryPath);
 
@@ -1909,7 +2116,7 @@ class FileSystemDAC {
 
     validateFileSystemEntityName(newPath.fileName);
 
-    final di = await getDirectoryIndex(newPath.directoryPath);
+    final di = await getDirectoryMetadata(newPath.directoryPath);
 
     if (di.directories.containsKey(newPath.fileName)) {
       throw 'Target directory already contains a subdirectory with that name.';
@@ -1927,20 +2134,20 @@ class FileSystemDAC {
     if (!res.success) return res;
 
     return await doOperationOnDirectory(parsePath(oldPath.directoryPath),
-        (directoryIndex) async {
+        (directoryIndex, writeKey) async {
       directoryIndex.directories.remove(oldPath.fileName);
     });
   }
 
-  bool isIndexPath(String path) {
+/*   bool isIndexPath(String path) {
     final uri = parsePath(path);
     return uri.path.startsWith('/$DATA_DOMAIN/$DATA_DOMAIN/index');
   }
-
+ */
   Future<DirectoryOperationTaskResult> updateFile(
     String directoryPath,
     String name,
-    FileData fileData,
+    FileVersion fileData,
   ) async {
     final path = parsePath(directoryPath);
 
@@ -1954,7 +2161,7 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       path,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (!directoryIndex.files.containsKey(name))
           throw 'Directory does not contain a file with this name, so it can\'t be updated';
 
@@ -1963,7 +2170,7 @@ class FileSystemDAC {
         df.modified = fileData.ts;
 
         df.history ??= {};
-        df.history![df.version.toString()] = df.file;
+        df.history![df.version] = df.file;
 
         df.version++;
 
@@ -1998,7 +2205,7 @@ class FileSystemDAC {
 
     final res = await doOperationOnDirectory(
       directoryUri,
-      (directoryIndex) async {
+      (directoryIndex, writeKey) async {
         if (!directoryIndex.files.containsKey(f.fileName))
           throw 'Directory does not contain a file with this name, so it can\'t be updated';
 
@@ -2025,7 +2232,7 @@ class FileSystemDAC {
 
   final _indexedExtKeysWithThumbnail = ['video', 'audio', 'image', 'thumbnail'];
 
-  Future<void> submitFileToIndexer(
+/*   Future<void> submitFileToIndexer(
       String directoryPath, DirectoryFile df) async {
     final extMap = Map.of(df.ext ?? <String, dynamic>{});
 
@@ -2054,18 +2261,18 @@ class FileSystemDAC {
         });
       }
     }
-  }
+  } */
 
 // TODO Optimize
-  Future<FileData> uploadFileData(
-    String multihash,
+  Future<FileVersion> uploadFileData(
+    Multihash hash,
     int size, {
     bool generateMetadata = false,
     String? filename,
     required Function customEncryptAndUploadFileFunction,
     Function? generateMetadataWrapper,
     Map<String, dynamic> additionalExt = const {},
-    List<String>? hashes,
+    List<Multihash>? hashes,
     bool metadataOnly = false,
   }) async {
     Map<String, dynamic>? ext;
@@ -2073,17 +2280,12 @@ class FileSystemDAC {
     if (generateMetadata) {
       print('trying to extract metadata...');
 
-      final rootPathSeed = await mySkyProvider.getEncryptedFileSeed(
-        DATA_DOMAIN,
-        true,
-      ); // TODO Make this work when not logged in
-
-      final res = await generateMetadataWrapper!(extension(filename!),
-          rootPathSeed /* extractMetadata, [bytes, rootPathSeed] */);
+      final res = await generateMetadataWrapper!(
+        extension(filename!),
+        thumbnailRootSeed /* extractMetadata, [bytes, rootPathSeed] */,
+      );
 
       ext = json.decode(res[0]);
-
-      int index = 1;
 
 /*       for (final type in ['audio', 'video']) {
         if ((ext?[type] ?? {})?['coverKey'] != null) {
@@ -2097,9 +2299,13 @@ class FileSystemDAC {
       } */
 
       if (ext?.containsKey('thumbnail') ?? false) {
-        ext!['thumbnail']['key'] =
-            (await mySkyProvider.userId()) + '/' + ext['thumbnail']['key'];
-        uploadThumbnail(ext['thumbnail']['key'], res[index]);
+        /* ext!['thumbnail']['key'] =
+            (await mySkyProvider.userId()) + '/' + ext['thumbnail']['key']; */
+        uploadThumbnailDirectly(
+          ext!['thumbnail']['cid'],
+          res[1],
+          res[2],
+        );
       }
     }
 
@@ -2112,13 +2318,10 @@ class FileSystemDAC {
     }
 
     if (metadataOnly) {
-      return FileData(
-        chunkSize: maxChunkSize,
-        encryptionType: 'none',
-        url: '',
-        key: '',
-        hash: multihash,
-        size: size,
+      return FileVersion(
+        encryptedCID: null,
+        /* hash: multihash,
+        size: size, */
         ts: nowTimestamp(),
         ext: ext,
       );
@@ -2137,17 +2340,21 @@ class FileSystemDAC {
     } */
     ext ??= {};
 
-    ext['uploader'] = UniversalPlatform.isWeb ? 'fs-dac.hns:1' : 'vup.hns:1';
+    ext['uploader'] = UniversalPlatform.isWeb ? 'skyfs:2' : 'vup:2';
 
-    final fileData = FileData(
-      chunkSize: res.maxChunkSize,
-      encryptionType: res.encryptionType,
-      padding: res.padding,
-      url: res.blobUrl,
-      key: res.secretKey == null ? null : base64Url.encode(res.secretKey!),
-      hash: multihash,
+    final fileData = FileVersion(
+      encryptedCID: EncryptedCID(
+          encryptionAlgorithm: encryptionAlgorithmXChaCha20Poly1305,
+          padding: res.padding!,
+          chunkSizeAsPowerOf2: res.chunkSizeAsPowerOf2!,
+          encryptedBlobHash: res.encryptedBlobHash,
+          encryptionKey: res.secretKey!,
+          originalCID: CID(
+            cidTypeRaw,
+            hash,
+            size: size,
+          )),
       hashes: hashes,
-      size: size,
       ts: nowTimestamp(),
       ext: ext,
     );
@@ -2159,31 +2366,33 @@ class FileSystemDAC {
   Set<String> uploadingThumbnailKeys = <String>{};
 
   // TODO Use pool to prevent too many concurrent uploads
-  Future<void> uploadThumbnail(String key, Uint8List bytes) async {
+  Future<void> uploadThumbnailDirectly(
+    String key,
+    Uint8List thumbnailBytes,
+    Uint8List cipherText,
+  ) async {
     if (uploadingThumbnailKeys.contains(key)) {
       return;
     }
     // final existing = await loadThumbnail(key);
-    if (!(await thumbnailCache
-        .containsKey(key /* .replaceFirst('/', '-') */))) {
+    if (!(await thumbnailCache.containsKey(key))) {
       uploadingThumbnailKeys.add(key);
-      await thumbnailCache.put(key /* .replaceFirst('/', '-') */, bytes);
-      final parts = key.split('/');
-
-      final keyInBytes = base64Url.decode(parts[1]);
+      await thumbnailCache.put(key, thumbnailBytes);
 
       await uploadThumbnailPool.withResource(() async {
         log('uploading thumbnail $key');
         final r = RetryOptions(maxAttempts: 12);
         await r.retry(
-          () => mySkyProvider.setRawDataEncrypted(
+          () => api.uploadRawFile(cipherText),
+
+          /* mySkyProvider.setRawDataEncrypted(
             temporaryThumbnailKeyPaths[parts[1]] ?? '',
             bytes,
             0,
             customEncryptedFileSeed: hex.encode(
               keyInBytes,
             ),
-          ),
+          ), */
           // retryIf: (e) => e is Exception,
         );
       });
@@ -2206,34 +2415,35 @@ class FileSystemDAC {
     thumbnailCompleters[key] = completer;
     log('loadThumbnail $key');
 
-    final parts = key.split('/');
-    if (parts.length != 2) return null;
-    final keyInBytes = base64Url.decode(parts[1]);
+    try {
+      final encryptedCID = EncryptedCID.decode(key.split('.').first);
 
-    final res = await mySkyProvider.getRawDataEncrypted(
-      '',
-      userID: parts[0],
-      pathSeed: hex.encode(
-        keyInBytes,
-      ),
-    );
+      final res = await api.downloadRawFile(encryptedCID.encryptedBlobHash);
 
-    if (res.data == null) {
+      final imageBytes = (await decryptChunk(
+        ciphertext: res,
+        index: 0,
+        key: encryptedCID.encryptionKey,
+        crypto: crypto,
+      ))
+          .sublist(
+        0,
+        res.length - (16 + encryptedCID.padding),
+      );
+      await thumbnailCache.put(key, imageBytes);
+
+      completer.complete(imageBytes);
+
+      return imageBytes;
+    } catch (e) {
       completer.complete(null);
       return null;
     }
-
-    final data = res.data!;
-    await thumbnailCache.put(key /* .replaceFirst('/', '-') */, data);
-
-    completer.complete(data);
-
-    return data;
   }
 
   final downloadChunkSize = 4 * 1000 * 1000;
 
-  Stream<List<int>> _downloadFileInChunks(
+/*   Stream<List<int>> _downloadFileInChunks(
       Uri url, int totalSize, Function setTotalSize) async* {
     for (int i = 0; i < totalSize; i += downloadChunkSize) {
       final res = await client.httpClient.get(
@@ -2256,19 +2466,19 @@ class FileSystemDAC {
 
       yield res.bodyBytes;
     }
-  }
+  } */
 
-  Future<Stream<Uint8List>> downloadAndDecryptFile(
-    FileData fileData, {
+/*   Future<Stream<Uint8List>> downloadAndDecryptFile(
+    FileVersion fileData, {
     Function? onProgress,
   }) async {
     log('downloadAndDecryptFile');
 
-    final chunkSize = fileData.chunkSize ?? maxChunkSize; // ?? maxChunkSize;
+    final chunkSize = fileData.encryptedCID!.chunkSize;
 
     onProgress ??= (double progress) {
       setFileState(
-        fileData.hash,
+        fileData.cid.hash,
         FileState(
           type: FileStateType.downloading,
           progress: progress,
@@ -2403,9 +2613,10 @@ class FileSystemDAC {
     );
 
     return transformer.map((event) => event.message);
-  }
+  } */
 
-  Future<Stream<Uint8List>> downloadAndDecryptFileInChunks(
+  // TODO Migrate
+  /* Future<Stream<Uint8List>> downloadAndDecryptFileInChunks(
     FileData fileData, {
     Function? onProgress,
     DownloadConfig? downloadConfig,
@@ -2526,7 +2737,7 @@ class FileSystemDAC {
         downloadedLength += newBytes.length;
 
         while (data.length > (chunkSize + 16)) {
-          log('[download+decrypt] decrypt chunk...');
+          log('[download+decrypt] decrypt chunk... (${data.length} ${chunkSize} ${downloadedLength})');
 
           final nonce = Uint8List.fromList(
             encodeEndian(
@@ -2536,18 +2747,25 @@ class FileSystemDAC {
             ) as List<int>,
           );
 
-          final r = sodium.crypto.secretBox.openEasy(
-            cipherText: Uint8List.fromList(
-              data.sublist(0, chunkSize + 16),
-            ),
-            nonce: nonce,
-            key: key,
-          );
-          streamCtrl.add(r);
+          try {
+            final r = sodium.crypto.secretBox.openEasy(
+              cipherText: Uint8List.fromList(
+                data.sublist(0, chunkSize + 16),
+              ),
+              nonce: nonce,
+              key: key,
+            );
+            streamCtrl.add(r);
 
-          currentChunk++;
+            currentChunk++;
 
-          data.removeRange(0, chunkSize + 16);
+            data.removeRange(0, chunkSize + 16);
+          } catch (e, st) {
+            data.clear();
+            downloadStreamCtrl.close();
+            /* progressSub?.cancel();
+            streamCtrl.close(); */
+          }
         }
 
         if (downloadedLength == totalEncSize) {
@@ -2599,7 +2817,7 @@ class FileSystemDAC {
     );
 
     return streamCtrl.stream;
-  }
+  } */
 /* 
   Future<EncryptAndUploadResponse> encryptAndUploadFile(
       Stream<Uint8List> stream, String fileMultiHash,
@@ -2670,25 +2888,37 @@ class FileSystemDAC {
     );
   } */
 
-  final Map<String, SkynetUser> skynetUserCache = {};
+  // final Map<String, SkynetUser> skynetUserCache = {};
 
-  Future<DataWithRevision<dynamic>> getJsonEncryptedWithUri(
+  Future<DataWithRevisionAndKeys<DirectoryMetadata>>
+      getDirectoryMetadataWithUri(
     Uri uri,
-    String uriHash,
+    Multihash uriHash,
   ) async {
-    log('getJsonEncryptedWithUri $uri');
+    log('getRawDataEncryptedWithUri $uri');
 
-    late String userId;
-    late String pathSeed;
+    // late String userId;
+    // late String pathSeed;
 
-    if (uri.host == 'local') {
-      userId = await mySkyProvider.userId();
-      pathSeed = await mySkyProvider.getEncryptedFileSeed(
-        uriPathToMySkyPath(uri.pathSegments),
-        false,
-      );
-    } else {
-      final userInfo = uri.userInfo;
+    Uint8List? writeKey;
+
+    late final Uint8List publicKey;
+    Uint8List? secretKey;
+    late final Uint8List? encryptionKey;
+
+    if (uri.host == 'root') {
+      writeKey = await getPrivateKeyForDirectory(uri);
+
+      final keys = await deriveKeysFromWriteKey(writeKey);
+      publicKey = keys.keyPair.publicKey;
+      secretKey = writeKey;
+      encryptionKey = keys.encryptionKey;
+    } else if (uri.host == 'shared-readonly') {
+      final keys = await getReadKeysForDirectory(uri);
+      publicKey = keys[0]!;
+      encryptionKey = keys[1];
+
+      /*   final userInfo = uri.userInfo;
       if (userInfo.startsWith('r:')) {
         userId = uri.host;
         final rootPathSeed = hex.encode(
@@ -2720,51 +2950,68 @@ class FileSystemDAC {
         );
       } else {
         throw 'Invalid URI';
-      }
-    }
-
-    final dataKey = deriveEncryptedFileTweak(pathSeed);
-    final encryptionKey = deriveEncryptedFileKeyEntropy(pathSeed);
-
-    final res = await mySkyProvider.client.registry.getEntry(
-      SkynetUser.fromId(userId),
-      '',
-      timeoutInSeconds: 10,
-      hashedDatakey: dataKey,
-    );
-    if (res == null) {
-      return DataWithRevision(null, -1);
-    }
-
-    if (collectSkylinks) {
-      final skylink = decodeSkylinkFromRegistryEntry(res.entry.data);
-      collectedSkylinks.add(skylink);
-    }
-
-    final cached = directoryIndexCache.get(uriHash);
-
-    if (res.entry.revision > (cached?.revision ?? -1)) {
-      final skylink = decodeSkylinkFromRegistryEntry(res.entry.data);
-      final contentRes = await mySkyProvider.client.httpClient.get(
-        Uri.https(mySkyProvider.client.portalHost, '$skylink'),
-        headers: mySkyProvider.client.headers,
-      );
-
-      final data = decryptJSONFile(contentRes.bodyBytes, encryptionKey);
-
-      if (data.containsKey('_data')) {
-        return DataWithRevision(
-          data['_data'],
-          res.entry.revision,
-          skylink: skylink,
-        );
-      }
-      return DataWithRevision(data, res.entry.revision, skylink: skylink);
+      } */
     } else {
-      return DataWithRevision(
-        json.decode(cached!.data),
+      throw 'Unsupported URI';
+    }
+
+    /* final dataKey = deriveEncryptedFileTweak(pathSeed);
+    final encryptionKey = deriveEncryptedFileKeyEntropy(pathSeed); */
+
+    final res = await api.registryGet(publicKey);
+
+    if (res == null) {
+      return DataWithRevisionAndKeys(
+        DirectoryMetadata(
+          details: DirectoryMetadataDetails({}),
+          directories: {},
+          files: {},
+          extraMetadata: ExtraMetadata({}),
+        ),
+        -1,
+        writeKey: writeKey,
+        encryptionKey: encryptionKey,
+        publicKey: publicKey,
+        secretKey: secretKey,
+        cid: null,
+      );
+    }
+
+    final cid = CID.fromBytes(res.data.sublist(1));
+
+    /*  if (collectSkylinks) {
+      collectedSkylinks.add(cid.encode());
+    } */
+
+    final cached = dirCache.get(uriHash);
+
+    if (res.revision > (cached?.revision ?? -1)) {
+      final contentRes = await api.downloadRawFile(cid.hash);
+
+      return DataWithRevisionAndKeys<DirectoryMetadata>(
+        DirectoryMetadata.deserizalize(
+          await decryptMutableBytes(
+            contentRes,
+            encryptionKey!,
+            crypto: crypto,
+          ),
+        ),
+        res.revision,
+        cid: cid,
+        writeKey: writeKey,
+        secretKey: secretKey,
+        encryptionKey: encryptionKey,
+        publicKey: publicKey,
+      );
+    } else {
+      return DataWithRevisionAndKeys(
+        cached!.data,
         cached.revision,
-        skylink: cached.skylink,
+        cid: cached.cid,
+        writeKey: writeKey,
+        secretKey: secretKey,
+        encryptionKey: encryptionKey,
+        publicKey: publicKey,
       );
     }
   }
@@ -2776,9 +3023,10 @@ class FileSystemDAC {
     String startDirectory = '',
     required int registryFetchDelay,
   }) async {
+    throw 'Not implemented';
     if (!rootAccessEnabled) {
       throw 'Permission denied';
-    }
+    } /* 
 
     collectSkylinks = true;
     collectedSkylinks = [];
@@ -2786,7 +3034,7 @@ class FileSystemDAC {
     Future<void> processDirectory(Uri uri) async {
       await Future.delayed(Duration(milliseconds: registryFetchDelay));
       final dir =
-          /* getDirectoryIndexCached(path) ??  */ await getDirectoryIndex(
+          /* getDirectoryMetadataCached(path) ??  */ await getDirectoryMetadata(
               uri.toString());
 
       if (dir.directories.isEmpty && dir.files.isEmpty) {
@@ -2841,10 +3089,10 @@ class FileSystemDAC {
 
     collectSkylinks = false;
     for (final s in collectedSkylinks) {
-      result[s] = 'DirectoryIndex';
+      result[s] = 'DirectoryMetadata';
     }
 
-    return result;
+    return result; */
   }
 
   Function? onLog;
@@ -2860,6 +3108,22 @@ class FileSystemDAC {
       }
     }
   }
+}
+
+extension MultiKeyExtension on Uint8List {
+  Uint8List toMultiKey() {
+    return Uint8List.fromList([mkeyEd25519] + this);
+  }
+}
+
+class KeyResponse {
+  final KeyPairEd25519 keyPair;
+  final Uint8List encryptionKey;
+
+  KeyResponse({
+    required this.keyPair,
+    required this.encryptionKey,
+  });
 }
 
 class FileStateNotifier extends StateNotifier<FileState> {
@@ -2888,16 +3152,17 @@ class FileStateNotifier extends StateNotifier<FileState> {
   } */
 }
 
-class DirectoryIndexChangeNotifier extends StateNotifier<DirectoryIndex?> {
-  DirectoryIndexChangeNotifier() : super(null);
+class DirectoryMetadataChangeNotifier
+    extends StateNotifier<DirectoryMetadata?> {
+  DirectoryMetadataChangeNotifier() : super(null);
 
-  void updateDirectoryIndex(DirectoryIndex index) {
+  void updateDirectoryMetadata(DirectoryMetadata index) {
     state = index;
   }
 }
 
 class UploadingFilesChangeNotifier
-    extends StateNotifier<Map<String, DirectoryFile>> {
+    extends StateNotifier<Map<String, FileReference>> {
   UploadingFilesChangeNotifier() : super({});
 
   void removeUploadingFile(String name) {
@@ -2907,7 +3172,7 @@ class UploadingFilesChangeNotifier
     state = map;
   }
 
-  void addUploadingFile(DirectoryFile file) {
+  void addUploadingFile(FileReference file) {
     final map = Map.of(state);
 
     map[file.name] = file;
@@ -2917,17 +3182,17 @@ class UploadingFilesChangeNotifier
 }
 
 class EncryptAndUploadResponse {
-  final String blobUrl;
+  final Multihash encryptedBlobHash;
   final Uint8List? secretKey;
-  final String? encryptionType;
-  final int? maxChunkSize;
+  // final String? encryptionType;
+  final int? chunkSizeAsPowerOf2;
   final int? padding;
   // final Uint8List nonce;
   EncryptAndUploadResponse({
-    required this.blobUrl,
+    required this.encryptedBlobHash,
     required this.secretKey,
-    required this.encryptionType,
-    required this.maxChunkSize,
+    // required this.encryptionType,
+    required this.chunkSizeAsPowerOf2,
     required this.padding,
     // required this.nonce,
   });
@@ -2997,4 +3262,30 @@ class DownloadConfig {
 
   String url;
   Map<String, String> headers;
+}
+
+class DataWithRevisionAndKeys<T> {
+  final T data;
+  final int revision;
+  final CID? cid;
+
+  final Uint8List? writeKey;
+
+  final Uint8List? secretKey;
+  final Uint8List publicKey;
+  final Uint8List? encryptionKey;
+
+  DataWithRevisionAndKeys(
+    this.data,
+    this.revision, {
+    required this.secretKey,
+    required this.writeKey,
+    required this.publicKey,
+    required this.encryptionKey,
+    required this.cid,
+  });
+
+  @override
+  String toString() =>
+      'DataWithRevisionAndKeys<$T>(revision: $revision, data: $data)';
 }
