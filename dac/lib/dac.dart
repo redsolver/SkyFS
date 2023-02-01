@@ -3147,7 +3147,12 @@ class FileStateNotifier extends StateNotifier<FileState> {
 
   void updateFileState(FileState fileState) {
     state = fileState;
+    if (fileState.type == FileStateType.idle) {
+      isCanceled = false;
+    }
   }
+
+  bool isCanceled = false;
 
   final _cancelStream = StreamController<Null>.broadcast();
 
@@ -3160,6 +3165,7 @@ class FileStateNotifier extends StateNotifier<FileState> {
   }
 
   void cancel() {
+    isCanceled = true;
     _cancelStream.add(null);
   }
 }
