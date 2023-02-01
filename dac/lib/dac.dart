@@ -3149,7 +3149,7 @@ class FileStateNotifier extends StateNotifier<FileState> {
     state = fileState;
   }
 
-/*   final _cancelStream = StreamController<Null>.broadcast();
+  final _cancelStream = StreamController<Null>.broadcast();
 
   Stream<Null> get onCancel => _cancelStream.stream;
 
@@ -3161,7 +3161,7 @@ class FileStateNotifier extends StateNotifier<FileState> {
 
   void cancel() {
     _cancelStream.add(null);
-  } */
+  }
 }
 
 class DirectoryMetadataChangeNotifier
