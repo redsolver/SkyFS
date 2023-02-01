@@ -1091,11 +1091,23 @@ class FileSystemDAC {
   }
 
   Multihash convertUriToHashForCache(Uri uri) {
-    return Multihash(Uint8List.fromList(
-      [mhashBlake3Default] +
-          crypto.hashBlake3Sync(
-              (Uint8List.fromList(utf8.encode(uri.toString())))),
-    ));
+    if (uri.pathSegments.isEmpty) {
+      return Multihash(Uint8List.fromList(
+        [mhashBlake3Default] +
+            crypto.hashBlake3Sync(
+                (Uint8List.fromList(utf8.encode(uri.toString())))),
+      ));
+    }
+    final dir = getDirectoryMetadataCached(
+      uri
+          .replace(
+            pathSegments:
+                uri.pathSegments.sublist(0, uri.pathSegments.length - 1),
+          )
+          .toString(),
+    );
+    ;
+    return Multihash(dir!.directories[uri.pathSegments.last]!.publicKey);
   }
 
   DirectoryMetadata? getDirectoryMetadataCached(String rawPath) {
