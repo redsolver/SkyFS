@@ -967,8 +967,7 @@ class FileSystemDAC {
       }
     }
 
-    // TODO Why?
-    if (uri.pathSegments.isEmpty) return;
+    // if (uri.pathSegments.isEmpty) return;
 
     if (doUpdate) {
       getDirectoryMetadataChangeNotifier(
