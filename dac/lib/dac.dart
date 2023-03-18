@@ -356,6 +356,7 @@ class FileSystemDAC {
 
   late Uint8List thumbnailRootSeed;
   late Uint8List filesystemRootKey;
+  late final Uint8List filesystemRootPublicKey;
 
   FileSystemDAC({
     required this.api,
@@ -373,6 +374,10 @@ class FileSystemDAC {
       1,
       crypto: crypto,
     );
+
+    filesystemRootPublicKey =
+        (await crypto.newKeyPairEd25519(seed: filesystemRootKey)).publicKey;
+
     thumbnailRootSeed = deriveHashBlake3Int(
       fsRootKey,
       2,
@@ -1093,11 +1098,15 @@ class FileSystemDAC {
 
   Multihash convertUriToHashForCache(Uri uri) {
     if (uri.pathSegments.isEmpty) {
-      return Multihash(Uint8List.fromList(
-        [mhashBlake3Default] +
-            crypto.hashBlake3Sync(
-                (Uint8List.fromList(utf8.encode(uri.toString())))),
-      ));
+      if (uri.host == 'root') {
+        return Multihash(filesystemRootPublicKey);
+      } else {
+        return Multihash(Uint8List.fromList(
+          [mhashBlake3Default] +
+              crypto.hashBlake3Sync(
+                  (Uint8List.fromList(utf8.encode(uri.toString())))),
+        ));
+      }
     }
     final dir = getDirectoryMetadataCached(
       uri
@@ -1107,7 +1116,6 @@ class FileSystemDAC {
           )
           .toString(),
     );
-    ;
     return Multihash(dir!.directories[uri.pathSegments.last]!.publicKey);
   }
 
