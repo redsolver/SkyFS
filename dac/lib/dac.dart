@@ -14,7 +14,7 @@ import 'package:lib5/src/crypto/encryption/chunk.dart';
 import 'package:lib5/src/crypto/encryption/mutable.dart';
 import 'package:lib5/util.dart';
 import 'package:mime_type/mime_type.dart';
-import 'package:minio/minio.dart';
+// import 'package:minio/minio.dart';
 import 'package:path/path.dart';
 import 'package:pool/pool.dart';
 import 'package:retry/retry.dart';
@@ -22,7 +22,7 @@ import 'package:stash/stash_api.dart';
 import 'package:state_notifier/state_notifier.dart';
 import 'package:universal_platform/universal_platform.dart';
 import 'package:uuid/uuid.dart';
-import 'package:webdav_client/webdav_client.dart' as webdav;
+// import 'package:webdav_client/webdav_client.dart' as webdav;
 
 const DATA_DOMAIN = 'fs-dac.hns';
 
@@ -443,7 +443,8 @@ class FileSystemDAC {
 
     if (UniversalPlatform.isWeb) {
       if (inMemoryOnly) {
-        dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
+        throw UnimplementedError();
+        /*  dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
           's5fs-directory-metadata-cache',
           bytes: Uint8List(0),
         ));
@@ -451,19 +452,19 @@ class FileSystemDAC {
         deletedSkylinks = await Hive.openBox<Uint8List>(
           's5fs-cids-to-unpin',
           bytes: Uint8List(0),
-        );
+        ); */
       } else {
         // TODO Implement
         throw UnimplementedError();
         /*  directoryIndexCache = await Hive.openBox<CachedEntry>(
           'fs-dac-directory-index-cache',
         ); */
-
       }
     } else {
-      dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
+      dirCache =
+          DirectoryMetadataCache(HiveKeyValueDB(await Hive.openBox<Uint8List>(
         's5fs-directory-metadata-cache',
-      ));
+      )));
 
       deletedSkylinks = await Hive.openBox<Uint8List>(
         's5fs-cids-to-unpin',
@@ -747,7 +748,7 @@ class FileSystemDAC {
 
   var customRemotes = <String, Map>{};
 
-  final _webDavClientCache = <String, webdav.Client>{};
+  // final _webDavClientCache = <String, webdav.Client>{};
 
   Future<void> loadRemotes() async {
     // TODO Implement
@@ -1901,7 +1902,7 @@ class FileSystemDAC {
     }
   } */
 
-  final _s3ClientCache = <String, Minio>{};
+/*   final _s3ClientCache = <String, Minio>{};
   Minio getS3Client(String remoteId, Map config) {
     if (!_s3ClientCache.containsKey(remoteId)) {
       _s3ClientCache[remoteId] = Minio(
@@ -1912,7 +1913,7 @@ class FileSystemDAC {
       );
     }
     return _s3ClientCache[remoteId]!;
-  }
+  } */
 
   Future<DirectoryOperationTaskResult> moveFile(
     String sourceFilePath,

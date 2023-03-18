@@ -1,33 +1,26 @@
 import 'dart:typed_data';
 
-import 'package:filesystem_dac/model/cached_entry.dart';
 import 'package:hive/hive.dart';
 import 'package:lib5/lib5.dart';
 
-import 'base.dart';
-
-// TODO Improve efficiency, especially for Vup
-
-class HiveDirectoryMetadataCache extends DirectoryMetadataCache {
+class HiveKeyValueDB extends KeyValueDB {
   final Box<Uint8List> box;
-  HiveDirectoryMetadataCache(this.box);
+  HiveKeyValueDB(this.box);
 
   @override
-  CachedDirectoryMetadata? get(Multihash hash) {
-    final bytes = box.get(hash.toBase64Url());
-    if (bytes != null) {
-      return CachedDirectoryMetadata.unpack(bytes);
-    }
-    return null;
-  }
+  bool contains(Uint8List key) => box.containsKey(String.fromCharCodes(key));
 
   @override
-  void set(Multihash hash, CachedDirectoryMetadata metadata) {
-    box.put(hash.toBase64Url(), metadata.pack());
-  }
+  Uint8List? get(Uint8List key) => box.get(String.fromCharCodes(key));
 
   @override
-  bool has(Multihash hash) {
-    return box.containsKey(hash.toBase64Url());
+  void set(Uint8List key, Uint8List value) => box.put(
+        String.fromCharCodes(key),
+        value,
+      );
+
+  @override
+  void delete(Uint8List key) {
+    box.delete(String.fromCharCodes(key));
   }
 }

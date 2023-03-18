@@ -20,11 +20,11 @@ dependencies:
   stash: ^4.0.1
   mime_type: ^1.0.0
   stash_hive: ^4.0.1
-  webdav_client:
-    git: https://github.com/redsolver/webdav_client.git
-  minio:
-    git:
-      url: https://github.com/redsolver/minio-dart.git
+  #webdav_client:
+  #  git: https://github.com/redsolver/webdav_client.git
+  #minio:
+  #  git:
+  #    url: https://github.com/redsolver/minio-dart.git
 
 dev_dependencies:
   build_runner: ^2.2.0
