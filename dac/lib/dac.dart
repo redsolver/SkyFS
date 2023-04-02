@@ -341,7 +341,6 @@ class FileSystemDAC {
 
   late final bool rootAccessEnabled;
 
-  late final Box<Uint8List> deletedSkylinks;
   // late final LazyBox<Uint8List> thumbnailCache;
   late final Cache<Uint8List> thumbnailCache;
 
@@ -452,12 +451,7 @@ class FileSystemDAC {
         /*  dirCache = HiveDirectoryMetadataCache(await Hive.openBox<Uint8List>(
           's5fs-directory-metadata-cache',
           bytes: Uint8List(0),
-        ));
-
-        deletedSkylinks = await Hive.openBox<Uint8List>(
-          's5fs-cids-to-unpin',
-          bytes: Uint8List(0),
-        ); */
+        ));  */
       } else {
         // TODO Implement
         throw UnimplementedError();
@@ -470,10 +464,6 @@ class FileSystemDAC {
           DirectoryMetadataCache(HiveKeyValueDB(await Hive.openBox<Uint8List>(
         's5fs-directory-metadata-cache',
       )));
-
-      deletedSkylinks = await Hive.openBox<Uint8List>(
-        's5fs-cids-to-unpin',
-      );
     }
   }
 
@@ -958,7 +948,7 @@ class FileSystemDAC {
         result = DirectoryOperationTaskResult(true); */
       }
       if (res.cid != null) {
-        deletedSkylinks.add(res.cid!.toBytes());
+        api.deleteCID(res.cid!);
       }
     }
     for (final task in tasks) {
@@ -1537,8 +1527,7 @@ class FileSystemDAC {
     );
   }
 
-  Future<DirectoryOperationTaskResult> createDirectory(
-      String path, String name) async {
+  Future<void> createDirectory(String path, String name) async {
     final uri = parsePath(path);
 
     validateAccess(
@@ -1561,17 +1550,14 @@ class FileSystemDAC {
             await _createDirectory(name, writeKey);
       },
     );
-
-    return res;
+    if (!res.success) throw res.error!;
   }
 
-  Future<DirectoryOperationTaskResult> deleteDirectory(
+  Future<void> deleteDirectory(
     String path,
     String name,
   ) async {
-    throw 'Operation not supported yet';
-
-/*     final uri = parsePath(path);
+    final uri = parsePath(path);
     final dirUri = uri.replace(
       path: uri.path + '/$name',
     );
@@ -1598,11 +1584,11 @@ class FileSystemDAC {
           throw 'Directory still contains subdirectories';
         if (directoryIndex.files.isNotEmpty)
           throw 'Directory still contains files';
-        // TODO Improve delete
-        directoryIndex = DirectoryMetadata(directories: {}, files: {});
+
+        return false;
       },
     );
-    if (!res.success) return res;
+    if (!res.success) throw res.error!;
 
     final res2 = await doOperationOnDirectory(
       uri,
@@ -1610,15 +1596,13 @@ class FileSystemDAC {
         directoryIndex.directories.remove(name);
       },
     );
-
-    return res2; */
+    if (!res2.success) throw res2.error!;
   }
 
-  Future<DirectoryOperationTaskResult> deleteDirectoryRecursive(
+  Future<void> deleteDirectoryRecursive(
     String path, {
     bool unpinEverything = false,
   }) async {
-    throw UnimplementedError();
     final uri = parsePath(path);
 
     validateAccess(
@@ -1633,46 +1617,51 @@ class FileSystemDAC {
       uri,
       (directoryIndex, writeKey) async {
         for (final name in directoryIndex.directories.keys) {
-          final res = await deleteDirectoryRecursive(
+          await deleteDirectoryRecursive(
             getChildUri(uri, name).toString(),
             unpinEverything: unpinEverything,
           );
-          if (!res.success) {
-            throw res.error!;
-          }
         }
         directoryIndex.directories = {};
 
         if (unpinEverything) {
           for (final file in directoryIndex.files.values) {
-            deleteFileSkylinks(file);
+            deleteFileCIDs(file);
           }
         }
 
         directoryIndex.files = {};
       },
     );
-    return res;
 
-    /*   
+    // TODO Clean up registry entries too
 
-    final res2 = await doOperationOnDirectory(
-      uri,
-      (directoryIndex) async {
-        directoryIndex.directories.remove(name);
-      },
-    );
-
-    return res2; */
-    return DirectoryOperationTaskResult(true);
+    if (!res.success) throw res.error!;
   }
 
-  void deleteFileSkylinks(FileReference file) {
-    for (final cid in <CID>[
-      file.file.cid,
-      ...(file.history?.values.map((e) => e.cid).toList() ?? [])
+  void deleteFileCIDs(FileReference file) {
+    for (final hash in <Multihash>[
+      file.file.encryptedCID!.encryptedBlobHash,
+      ...(file.history?.values
+              .map((e) => e.encryptedCID!.encryptedBlobHash)
+              .toList() ??
+          [])
     ]) {
-      deletedSkylinks.add(cid.toBytes());
+      api.deleteCID(CID(cidTypeRaw, hash, size: 0));
+    }
+    final thumbnailCID = file.ext?['thumbnail']?['cid'];
+
+    if (thumbnailCID != null) {
+      final encryptedThumbnailCID = EncryptedCID.decode(
+        thumbnailCID.split('.').first,
+      );
+      api.deleteCID(
+        CID(
+          cidTypeRaw,
+          encryptedThumbnailCID.encryptedBlobHash,
+          size: 0,
+        ),
+      );
     }
 
     // TODO Delete thumbnails
@@ -1758,7 +1747,7 @@ class FileSystemDAC {
     return 'skyfs://rw:${base64Url.encode(seed)}@shared';
   }
 
-  Future<DirectoryOperationTaskResult> createFile(
+  Future<void> createFile(
       String directoryPath, String name, FileVersion fileData,
       {String? customMimeType}) async {
     final path = parsePath(directoryPath);
@@ -1801,7 +1790,7 @@ class FileSystemDAC {
     if (createdFile != null) {
       res.data = json.decode(json.encode(createdFile));
     }
-    return res;
+    if (!res.success) throw res.error!;
   }
 
   FilePathParseResponse parseFilePath(String filePath) {
@@ -1824,7 +1813,7 @@ class FileSystemDAC {
         filePath.substring(0, filePath.length - fileName.length - 1), fileName);
   }
 
-  Future<DirectoryOperationTaskResult> copyFile(
+  Future<void> copyFile(
     String sourceFilePath,
     String targetDirectoryPath, {
     bool generatePresignedUrls = false,
@@ -1866,7 +1855,7 @@ class FileSystemDAC {
         directoryIndex.files[sourceFileName] = file;
       },
     );
-    return res;
+    if (!res.success) throw res.error!;
   }
 
 /*   Future<void> generatePresignedUrlsForFile(DirectoryReference df) async {
@@ -1922,7 +1911,7 @@ class FileSystemDAC {
     return _s3ClientCache[remoteId]!;
   } */
 
-  Future<DirectoryOperationTaskResult> moveFile(
+  Future<void> moveFile(
     String sourceFilePath,
     String targetFilePath, {
     bool generateRandomKey = false,
@@ -1975,10 +1964,10 @@ class FileSystemDAC {
         sourceDirIndex.files.remove(source.fileName);
       },
     );
-    return res;
+    if (!res.success) throw res.error!;
   }
 
-  Future<DirectoryOperationTaskResult> renameFile(
+  Future<void> renameFile(
     String filePath,
     String newName,
   ) async {
@@ -2011,10 +2000,11 @@ class FileSystemDAC {
         directoryIndex.files.remove(file.fileName);
       },
     );
-    return res;
+
+    if (!res.success) throw res.error!;
   }
 
-  Future<DirectoryOperationTaskResult> deleteFile(
+  Future<void> deleteFile(
     String filePath,
   ) async {
     final file = parseFilePath(filePath);
@@ -2047,12 +2037,13 @@ class FileSystemDAC {
           print(e);
           print(st);
         } */
-        deleteFileSkylinks(directoryIndex.files[file.fileName]!);
+        deleteFileCIDs(directoryIndex.files[file.fileName]!);
 
         directoryIndex.files.remove(file.fileName);
       },
     );
-    return res;
+
+    if (!res.success) throw res.error!;
   }
 
   Future<void> cloneDirectory(
@@ -2108,12 +2099,10 @@ class FileSystemDAC {
     );
   }
 
-  Future<DirectoryOperationTaskResult> moveDirectory(
+  Future<void> moveDirectory(
     String sourceDirectoryPath,
     String targetDirectoryPath,
   ) async {
-    throw UnimplementedError();
-
     final sourceDirectory = parsePath(sourceDirectoryPath);
     final targetDirectory = parsePath(targetDirectoryPath);
 
@@ -2133,30 +2122,72 @@ class FileSystemDAC {
 
     final oldPath = parseFilePath(sourceDirectoryPath);
     final newPath = parseFilePath(targetDirectoryPath);
-
     validateFileSystemEntityName(newPath.fileName);
 
-    final di = await getDirectoryMetadata(newPath.directoryPath);
-
-    if (di.directories.containsKey(newPath.fileName)) {
-      throw 'Target directory already contains a subdirectory with that name.';
-    }
-
-    await cloneDirectory(sourceDirectoryPath, targetDirectoryPath);
-
-    await createDirectory(newPath.directoryPath, newPath.fileName);
-
-    final res = await deleteDirectoryRecursive(
-      sourceDirectoryPath,
-      unpinEverything: false,
-    );
-
-    if (!res.success) return res;
-
-    return await doOperationOnDirectory(parsePath(oldPath.directoryPath),
+    if (oldPath.directoryPath == newPath.directoryPath) {
+      final res = await doOperationOnDirectory(
+        parsePath(oldPath.directoryPath),
         (directoryIndex, writeKey) async {
-      directoryIndex.directories.remove(oldPath.fileName);
-    });
+          if (!directoryIndex.directories.containsKey(oldPath.fileName)) {
+            throw 'Source directory does not exist';
+          }
+
+          if (directoryIndex.directories.containsKey(newPath.fileName)) {
+            throw 'Target directory already exists';
+          }
+
+          final dir = directoryIndex.directories.remove(oldPath.fileName)!;
+          dir.name = newPath.fileName;
+          directoryIndex.directories[newPath.fileName] = dir;
+        },
+      );
+
+      if (!res.success) throw res.error!;
+    } else {
+      final res = await doOperationOnDirectory(
+        parsePath(oldPath.directoryPath),
+        (sourceDirIndex, writeKey) async {
+          if (!sourceDirIndex.directories.containsKey(oldPath.fileName)) {
+            throw 'Source directory does not exist';
+          }
+
+          final res = await doOperationOnDirectory(
+            parsePath(newPath.directoryPath),
+            (targetDirIndex, writeKey) async {
+              if (targetDirIndex.directories.containsKey(newPath.fileName)) {
+                throw 'Target directory already exists';
+              }
+
+              final dir = sourceDirIndex.directories[oldPath.fileName]!;
+
+              final oldEncryptedWriteKey =
+                  await getPrivateKeyForDirectory(sourceDirectory);
+
+              final nonce = crypto.generateRandomBytes(24);
+
+              final newEncryptedWriteKey =
+                  await crypto.encryptXChaCha20Poly1305(
+                key: writeKey,
+                nonce: nonce,
+                plaintext: oldEncryptedWriteKey,
+              );
+
+              dir.encryptedWriteKey = Uint8List.fromList(
+                [0x01] + nonce + newEncryptedWriteKey,
+              );
+
+              dir.name = newPath.fileName;
+
+              targetDirIndex.directories[newPath.fileName] = dir;
+            },
+          );
+          if (res.success != true) throw res.error!;
+          sourceDirIndex.directories.remove(oldPath.fileName);
+          privateKeyCache.remove(sourceDirectory);
+        },
+      );
+      if (!res.success) throw res.error!;
+    }
   }
 
 /*   bool isIndexPath(String path) {
@@ -2164,7 +2195,7 @@ class FileSystemDAC {
     return uri.path.startsWith('/$DATA_DOMAIN/$DATA_DOMAIN/index');
   }
  */
-  Future<DirectoryOperationTaskResult> updateFile(
+  Future<void> updateFile(
     String directoryPath,
     String name,
     FileVersion fileData,
@@ -2206,10 +2237,10 @@ class FileSystemDAC {
       },
     );
 
-    return res;
+    if (!res.success) throw res.error!;
   }
 
-  Future<DirectoryOperationTaskResult> updateFileExtensionData(
+  Future<void> updateFileExtensionData(
     String uri,
     Map<String, dynamic>? newExtData,
   ) async {
@@ -2233,7 +2264,7 @@ class FileSystemDAC {
       },
     );
 
-    return res;
+    if (!res.success) throw res.error!;
   }
 
   final _indexedExtKeys = [
