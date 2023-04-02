@@ -411,6 +411,60 @@ class FileSystemDAC {
     return _directoryIndexChangeNotifiers[uriHash]!;
   }
 
+  final _activeListeningURIs = <Uri>{};
+
+  void listenForDirectoryChanges(Uri uri) async {
+    if (_activeListeningURIs.contains(uri)) return;
+    _activeListeningURIs.add(uri);
+
+    late final Uint8List publicKey;
+
+    late final Uint8List? encryptionKey;
+
+    if (uri.host == 'root') {
+      final writeKey = await getPrivateKeyForDirectory(uri);
+      final keys = await deriveKeysFromWriteKey(writeKey);
+      publicKey = keys.keyPair.publicKey;
+      encryptionKey = keys.encryptionKey;
+    } else if (uri.host == 'shared-readonly') {
+      final keys = await getReadKeysForDirectory(uri);
+      publicKey = keys[0]!;
+      encryptionKey = keys[1];
+    } else {
+      throw 'Unsupported URI';
+    }
+
+    api.registryListen(publicKey).listen((sre) async {
+      final cached = dirCache.get(Multihash(publicKey));
+
+      final cid = CID.fromBytes(sre.data.sublist(1));
+
+      if (sre.revision > (cached?.revision ?? -1)) {
+        final contentRes = await api.downloadRawFile(cid.hash);
+
+        final dirMeta = DirectoryMetadata.deserizalize(
+          await decryptMutableBytes(
+            contentRes,
+            encryptionKey!,
+            crypto: crypto,
+          ),
+        );
+
+        dirCache.set(
+          Multihash(publicKey),
+          CachedDirectoryMetadata(
+            data: dirMeta,
+            revision: sre.revision,
+            cid: cid,
+          ),
+        );
+
+        getDirectoryMetadataChangeNotifier(Multihash(publicKey))
+            .updateDirectoryMetadata(dirMeta);
+      }
+    });
+  }
+
   UploadingFilesChangeNotifier getUploadingFilesChangeNotifier(
     String path,
   ) {
@@ -3034,7 +3088,7 @@ class FileSystemDAC {
       collectedSkylinks.add(cid.encode());
     } */
 
-    final cached = dirCache.get(uriHash);
+    final cached = dirCache.get(Multihash(publicKey));
 
     if (res.revision > (cached?.revision ?? -1)) {
       final contentRes = await api.downloadRawFile(cid.hash);
