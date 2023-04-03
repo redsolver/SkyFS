@@ -302,7 +302,7 @@ packages:
     description:
       path: "."
       ref: HEAD
-      resolved-ref: f50cd57378fef6bac7e7075e99a7439cc2a9c78e
+      resolved-ref: c47c33a134691b73c8bfc1f4157ad446ba509918
       url: "https://github.com/s5-dev/lib5.git"
     source: git
     version: "0.1.0"

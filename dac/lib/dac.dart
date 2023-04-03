@@ -1703,31 +1703,20 @@ class FileSystemDAC {
     ]) {
       api.deleteCID(CID(cidTypeRaw, hash, size: 0));
     }
-    final thumbnailCID = file.ext?['thumbnail']?['cid'];
-
-    if (thumbnailCID != null) {
-      final encryptedThumbnailCID = EncryptedCID.decode(
-        thumbnailCID.split('.').first,
-      );
-      api.deleteCID(
-        CID(
-          cidTypeRaw,
-          encryptedThumbnailCID.encryptedBlobHash,
-          size: 0,
-        ),
-      );
-    }
-
-    // TODO Delete thumbnails
-    /* for (final key in [
-      file.ext?['audio']?['coverKey'],
-      file.ext?['video']?['coverKey'],
-      file.ext?['thumbnail']?['key'],
+    for (final EncryptedCID? thumbnailCID in [
+      file.file.thumbnail?.cid,
+      ...(file.history?.values.map((e) => e.thumbnail?.cid).toList() ?? [])
     ]) {
-      if (key != null) {
-        deletedSkylinks.add(key);
+      if (thumbnailCID != null) {
+        api.deleteCID(
+          CID(
+            cidTypeRaw,
+            thumbnailCID.encryptedBlobHash,
+            size: 0,
+          ),
+        );
       }
-    } */
+    }
   }
 
 /*   Future<SkynetUser> _getSkynetUser(String userInfo) async {
@@ -2335,8 +2324,6 @@ class FileSystemDAC {
     }
   }
 
-  final _indexedExtKeysWithThumbnail = ['video', 'audio', 'image', 'thumbnail'];
-
 /*   Future<void> submitFileToIndexer(
       String directoryPath, DirectoryFile df) async {
     final extMap = Map.of(df.ext ?? <String, dynamic>{});
@@ -2381,6 +2368,7 @@ class FileSystemDAC {
     bool metadataOnly = false,
   }) async {
     Map<String, dynamic>? ext;
+    FileVersionThumbnail? thumbnail;
 
     if (generateMetadata) {
       print('trying to extract metadata...');
@@ -2391,6 +2379,7 @@ class FileSystemDAC {
       );
 
       ext = json.decode(res[0]);
+      thumbnail = res[1];
 
 /*       for (final type in ['audio', 'video']) {
         if ((ext?[type] ?? {})?['coverKey'] != null) {
@@ -2403,13 +2392,11 @@ class FileSystemDAC {
         }
       } */
 
-      if (ext?.containsKey('thumbnail') ?? false) {
-        /* ext!['thumbnail']['key'] =
-            (await mySkyProvider.userId()) + '/' + ext['thumbnail']['key']; */
+      if (thumbnail != null) {
         uploadThumbnailDirectly(
-          ext!['thumbnail']['cid'],
-          res[1],
+          thumbnail.cid,
           res[2],
+          res[3],
         );
       }
     }
@@ -2428,6 +2415,7 @@ class FileSystemDAC {
         /* hash: multihash,
         size: size, */
         ts: nowTimestamp(),
+        thumbnail: thumbnail,
         ext: ext,
       );
     }
@@ -2461,6 +2449,7 @@ class FileSystemDAC {
           )),
       hashes: hashes,
       ts: nowTimestamp(),
+      thumbnail: thumbnail,
       ext: ext,
     );
     return fileData;
@@ -2468,21 +2457,22 @@ class FileSystemDAC {
 
   final uploadThumbnailPool = Pool(2);
 
-  Set<String> uploadingThumbnailKeys = <String>{};
+  Set<Multihash> uploadingThumbnailKeys = <Multihash>{};
 
   // TODO Use pool to prevent too many concurrent uploads
   Future<void> uploadThumbnailDirectly(
-    String key,
+    EncryptedCID thumbnailKey,
     Uint8List thumbnailBytes,
     Uint8List cipherText,
   ) async {
+    final key = thumbnailKey.originalCID.hash;
     if (uploadingThumbnailKeys.contains(key)) {
       return;
     }
+    uploadingThumbnailKeys.add(key);
     // final existing = await loadThumbnail(key);
-    if (!(await thumbnailCache.containsKey(key))) {
-      uploadingThumbnailKeys.add(key);
-      await thumbnailCache.put(key, thumbnailBytes);
+    if (!(await thumbnailCache.containsKey(key.toBase64Url()))) {
+      await thumbnailCache.put(key.toBase64Url(), thumbnailBytes);
 
       await uploadThumbnailPool.withResource(() async {
         log('uploading thumbnail $key');
@@ -2506,12 +2496,14 @@ class FileSystemDAC {
 
   // Map<String, Uint8List> thumbnailCache = {};
 
-  Map<String, Completer<Uint8List?>> thumbnailCompleters = {};
+  Map<Multihash, Completer<Uint8List?>> thumbnailCompleters = {};
 
   // TODO Optimization: only 1 concurrent instance / key
-  Future<Uint8List?> loadThumbnail(String key) async {
-    if (await thumbnailCache.containsKey(key /* .replaceFirst('/', '-') */)) {
-      return thumbnailCache.get(key /* .replaceFirst('/', '-') */);
+  Future<Uint8List?> loadThumbnail(EncryptedCID thumbnailKey) async {
+    final key = thumbnailKey.originalCID.hash;
+    final keyStr = key.toBase64Url();
+    if (await thumbnailCache.containsKey(keyStr)) {
+      return thumbnailCache.get(keyStr);
     }
     if (thumbnailCompleters.containsKey(key)) {
       return thumbnailCompleters[key]!.future;
@@ -2521,21 +2513,19 @@ class FileSystemDAC {
     log('loadThumbnail $key');
 
     try {
-      final encryptedCID = EncryptedCID.decode(key.split('.').first);
-
-      final res = await api.downloadRawFile(encryptedCID.encryptedBlobHash);
+      final res = await api.downloadRawFile(thumbnailKey.encryptedBlobHash);
 
       final imageBytes = (await decryptChunk(
         ciphertext: res,
         index: 0,
-        key: encryptedCID.encryptionKey,
+        key: thumbnailKey.encryptionKey,
         crypto: crypto,
       ))
           .sublist(
         0,
-        res.length - (16 + encryptedCID.padding),
+        res.length - (16 + thumbnailKey.padding),
       );
-      await thumbnailCache.put(key, imageBytes);
+      await thumbnailCache.put(keyStr, imageBytes);
 
       completer.complete(imageBytes);
 
