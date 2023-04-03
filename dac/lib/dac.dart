@@ -2283,9 +2283,10 @@ class FileSystemDAC {
     if (!res.success) throw res.error!;
   }
 
-  Future<void> updateFileExtensionData(
+  Future<void> updateFileExtensionDataAndThumbnail(
     String uri,
     Map<String, dynamic>? newExtData,
+    FileVersionThumbnail? thumbnail,
   ) async {
     final f = parseFilePath(uri);
 
@@ -2304,6 +2305,7 @@ class FileSystemDAC {
           throw 'Directory does not contain a file with this name, so it can\'t be updated';
 
         directoryIndex.files[f.fileName]!.ext = newExtData;
+        directoryIndex.files[f.fileName]!.file.thumbnail = thumbnail;
       },
     );
 
