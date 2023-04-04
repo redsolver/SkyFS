@@ -540,33 +540,39 @@ class FileSystemDAC {
 
     log('createRootDirectory $skapp [skapp: $skapp]');
 
-    await doOperationOnDirectory(
-      Uri.parse('skyfs://root'),
-      (directoryIndex, writeKey) async {
-        bool doUpdate = false;
+    final cachedRootDir = getDirectoryMetadataCached('skyfs://root');
 
-        if (!directoryIndex.directories.containsKey('home')) {
-          directoryIndex.directories['home'] =
-              await _createDirectory('home', writeKey);
+    if (cachedRootDir == null ||
+        !(cachedRootDir.directories.containsKey('home') &&
+            cachedRootDir.directories.containsKey('vup.hns'))) {
+      await doOperationOnDirectory(
+        Uri.parse('skyfs://root'),
+        (directoryIndex, writeKey) async {
+          bool doUpdate = false;
 
-          doUpdate = true;
-        }
+          if (!directoryIndex.directories.containsKey('home')) {
+            directoryIndex.directories['home'] =
+                await _createDirectory('home', writeKey);
 
-        if (!directoryIndex.directories.containsKey(skapp)) {
-          directoryIndex.directories[skapp] =
-              await _createDirectory(skapp, writeKey);
-          doUpdate = true;
-        }
+            doUpdate = true;
+          }
 
-        if (!directoryIndex.directories.containsKey('vup.hns')) {
-          directoryIndex.directories['vup.hns'] =
-              await _createDirectory('vup.hns', writeKey);
-          doUpdate = true;
-        }
+          if (!directoryIndex.directories.containsKey(skapp)) {
+            directoryIndex.directories[skapp] =
+                await _createDirectory(skapp, writeKey);
+            doUpdate = true;
+          }
 
-        return doUpdate;
-      },
-    );
+          if (!directoryIndex.directories.containsKey('vup.hns')) {
+            directoryIndex.directories['vup.hns'] =
+                await _createDirectory('vup.hns', writeKey);
+            doUpdate = true;
+          }
+
+          return doUpdate;
+        },
+      );
+    }
 
     doOperationOnDirectory(
       Uri.parse('skyfs://root/vup.hns'),
