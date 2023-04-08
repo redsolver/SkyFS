@@ -421,7 +421,7 @@ class FileSystemDAC {
 
     late final Uint8List? encryptionKey;
 
-    if (uri.host == 'root') {
+    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
       final writeKey = await getPrivateKeyForDirectory(uri);
       final keys = await deriveKeysFromWriteKey(writeKey);
       publicKey = keys.keyPair.publicKey;
@@ -1306,15 +1306,16 @@ class FileSystemDAC {
   final privateKeyCache = <Uri, Uint8List>{};
 
   Future<Uint8List> getPrivateKeyForDirectory(Uri uri) async {
-    if (uri.host != 'root') {
-      throw 'Unsupported URI (host)';
-    }
     if (privateKeyCache.containsKey(uri)) {
       return privateKeyCache[uri]!;
     }
 
     if (uri.pathSegments.isEmpty) {
-      return filesystemRootKey;
+      if (uri.host == 'root') {
+        return filesystemRootKey;
+      } else {
+        return base64UrlNoPaddingDecode(uri.userInfo);
+      }
     }
 
     final parentUri = uri.replace(
@@ -1745,7 +1746,7 @@ class FileSystemDAC {
       write: false,
     );
 
-    if (uri.host == 'root') {
+    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
       final writeKey = await getPrivateKeyForDirectory(uri);
 
       final keys = await deriveKeysFromWriteKey(writeKey);
@@ -1758,43 +1759,32 @@ class FileSystemDAC {
     } else {
       throw 'Sharing already shared URIs is not supported yet';
     }
-
-    /* 
-
-    if (uri.host != 'local') {
-      final userInfo = uri.userInfo;
-      if (userInfo.startsWith('rw:')) {
-        final skynetUser = await _getSkynetUser(userInfo);
-
-        final path = uri.pathSegments.join('/'); // TODO Test this
-
-        final pathSeed = await mysky_io_impl.getEncryptedPathSeed(
-          path,
-          true,
-          skynetUser.rawSeed,
-        );
-
-        return 'skyfs://r:${base64Url.encode(hex.decode(pathSeed))}@${skynetUser.id}';
-      } else {
-        return uri.toString();
-      }
-    }
-
-    log('getEncryptedFileSeed ${uri.pathSegments.join('/')}');
-
-    final pathSeed = await mySkyProvider.getEncryptedFileSeed(
-        uri.pathSegments.join('/'), true);
-    log('getShareUriReadOnly -> ${pathSeed.length} $pathSeed');
-
-    return 'skyfs://r:${base64Url.encode(hex.decode(pathSeed))}@${await mySkyProvider.userId()}'; */
   }
 
-  // TODO Better method name
-  Future<String> generateSharedReadWriteDirectory() async {
+  Future<String> getShareUriReadWrite(String path) async {
+    final uri = parsePath(path);
+
+    validateAccess(
+      uri,
+      read: true,
+      write: true,
+    );
+
+    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
+      final writeKey = await getPrivateKeyForDirectory(uri);
+      return 'skyfs://${base64UrlNoPaddingEncode(writeKey)}@shared-readwrite';
+    } else if (uri.host == 'shared-readonly') {
+      throw 'Generating a read-write share URI for a read-only share URI is not possible';
+    } else {
+      throw 'Unsupported URI';
+    }
+  }
+
+/*   Future<String> generateSharedReadWriteDirectory() async {
     final seed = crypto.generateRandomBytes(16);
 
     return 'skyfs://rw:${base64Url.encode(seed)}@shared';
-  }
+  } */
 
   Future<void> createFile(
       String directoryPath, String name, FileVersion fileData,
@@ -3009,7 +2999,7 @@ class FileSystemDAC {
     Uint8List? secretKey;
     late final Uint8List? encryptionKey;
 
-    if (uri.host == 'root') {
+    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
       writeKey = await getPrivateKeyForDirectory(uri);
 
       final keys = await deriveKeysFromWriteKey(writeKey);
