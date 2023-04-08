@@ -971,7 +971,7 @@ class FileSystemDAC {
 
       final cid = await api.uploadRawFile(cipherText);
 
-      if (uri.host == 'root') {
+      if (uri.host == 'root' || uri.host == 'shared-readwrite') {
         final kp = await crypto.newKeyPairEd25519(seed: res.secretKey!);
 
         final sre = await signRegistryEntry(
