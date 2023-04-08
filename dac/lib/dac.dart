@@ -1129,15 +1129,9 @@ class FileSystemDAC {
       if (write) {
         throw 'Can\'t write to read-only shared directories or files';
       }
+    } else if (uri.host == 'shared-readwrite') {
     } else {
-      if (uri.userInfo.startsWith('r:') || uri.host == 'remote') {
-        if (write) {
-          throw 'Can\'t write to read-only shared directories or files';
-        }
-      } else if (uri.userInfo.startsWith('rw:')) {
-      } else {
-        throw 'URI not supported (you might be using a deprecated format) $uri';
-      }
+      throw 'URI not supported (you might be using a deprecated format) $uri';
     }
   }
 
