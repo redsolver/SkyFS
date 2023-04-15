@@ -1805,7 +1805,6 @@ class FileSystemDAC {
 
         final file = FileReference(
           created: fileData.ts,
-          modified: fileData.ts,
           name: name,
           mimeType: customMimeType ?? mimeFromExtension(name.split('.').last),
           version: 0,
@@ -2285,8 +2284,6 @@ class FileSystemDAC {
 
         final df = directoryIndex.files[name]!;
 
-        df.modified = fileData.ts;
-
         df.history ??= {};
         df.history![df.version] = df.file;
 
@@ -2336,18 +2333,26 @@ class FileSystemDAC {
     if (!res.success) throw res.error!;
   }
 
-  final _indexedExtKeys = [
-    'video',
-    'audio',
-    'image'
-  ]; // TODO Maybe Comics, books, documents
+  Future<void> updateDirectoryDetails(
+    String uri,
+    DirectoryMetadataDetails details,
+  ) async {
+    final directoryUri = parsePath(uri);
 
-  String? _getTypeFromExtMap(Map<String, dynamic> ext) {
-    for (final key in _indexedExtKeys) {
-      if (ext.containsKey(key)) {
-        return key;
-      }
-    }
+    validateAccess(
+      directoryUri,
+      read: true,
+      write: true,
+    );
+
+    final res = await doOperationOnDirectory(
+      directoryUri,
+      (dir, writeKey) async {
+        dir.details.data.addAll(details.data);
+      },
+    );
+
+    if (!res.success) throw res.error!;
   }
 
 /*   Future<void> submitFileToIndexer(
