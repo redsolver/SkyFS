@@ -544,7 +544,8 @@ class FileSystemDAC {
 
     if (cachedRootDir == null ||
         !(cachedRootDir.directories.containsKey('home') &&
-            cachedRootDir.directories.containsKey('vup.hns'))) {
+            cachedRootDir.directories.containsKey('vup.hns') &&
+            cachedRootDir.directories.containsKey('.trash'))) {
       await doOperationOnDirectory(
         Uri.parse('skyfs://root'),
         (directoryIndex, writeKey) async {
@@ -553,6 +554,13 @@ class FileSystemDAC {
           if (!directoryIndex.directories.containsKey('home')) {
             directoryIndex.directories['home'] =
                 await _createDirectory('home', writeKey);
+
+            doUpdate = true;
+          }
+
+          if (!directoryIndex.directories.containsKey('.trash')) {
+            directoryIndex.directories['.trash'] =
+                await _createDirectory('.trash', writeKey);
 
             doUpdate = true;
           }
