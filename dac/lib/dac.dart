@@ -1948,6 +1948,7 @@ class FileSystemDAC {
     String sourceFilePath,
     String targetFilePath, {
     bool generateRandomKey = false,
+    bool trash = false,
   }) async {
     final source = parseFilePath(sourceFilePath);
     final target = parseFilePath(targetFilePath);
@@ -1990,7 +1991,24 @@ class FileSystemDAC {
             targetDirIndex.files[targetKey] =
                 sourceDirIndex.files[source.fileName]!;
 
-            targetDirIndex.files[targetKey]!.name = target.fileName;
+            final file = targetDirIndex.files[targetKey]!;
+
+            file.name = target.fileName;
+
+            if (trash) {
+              file.ext ??= {};
+              file.ext!['trash'] = {
+                'uri': sourceFilePath,
+                'ts': (DateTime.now().millisecondsSinceEpoch / 1000).round(),
+              };
+            } else {
+              if (file.ext?.containsKey('trash') ?? false) {
+                file.ext!.remove('trash');
+                if (file.ext!.isEmpty) {
+                  file.ext = null;
+                }
+              }
+            }
           },
         );
         if (res.success != true) throw res.error!;
@@ -2134,8 +2152,9 @@ class FileSystemDAC {
 
   Future<void> moveDirectory(
     String sourceDirectoryPath,
-    String targetDirectoryPath,
-  ) async {
+    String targetDirectoryPath, {
+    bool trash = false,
+  }) async {
     final sourceDirectory = parsePath(sourceDirectoryPath);
     final targetDirectory = parsePath(targetDirectoryPath);
 
@@ -2210,6 +2229,21 @@ class FileSystemDAC {
               );
 
               dir.name = newPath.fileName;
+
+              if (trash) {
+                dir.ext ??= {};
+                dir.ext!['trash'] = {
+                  'uri': sourceDirectoryPath,
+                  'ts': (DateTime.now().millisecondsSinceEpoch / 1000).round(),
+                };
+              } else {
+                if (dir.ext?.containsKey('trash') ?? false) {
+                  dir.ext!.remove('trash');
+                  if (dir.ext!.isEmpty) {
+                    dir.ext = null;
+                  }
+                }
+              }
 
               targetDirIndex.directories[newPath.fileName] = dir;
             },
