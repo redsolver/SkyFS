@@ -413,29 +413,113 @@ class FileSystemDAC {
 
   final _activeListeningURIs = <Uri>{};
 
-  void listenForDirectoryChanges(Uri uri) async {
-    if (_activeListeningURIs.contains(uri)) return;
-    _activeListeningURIs.add(uri);
+  Future<KeySet> getKeySet(Uri uri) async {
+    if (keySetCache.containsKey(uri)) {
+      return keySetCache[uri]!;
+    }
 
-    late final Uint8List publicKey;
+    if (uri.pathSegments.isEmpty) {
+      if (uri.host == 'shared-readonly') {
+        final parts = uri.userInfo.split(':');
+        return KeySet(
+          publicKey: base64UrlNoPaddingDecode(parts[0]),
+          writeKey: null,
+          encryptionKey: base64UrlNoPaddingDecode(parts[1]),
+        );
+      }
+    }
 
-    late final Uint8List? encryptionKey;
+    late final KeySet keySet;
 
-    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
-      final writeKey = await getPrivateKeyForDirectory(uri);
+    final writeKey = await getPrivateKeyForDirectory(uri);
+
+    if (writeKey != null) {
       final keys = await deriveKeysFromWriteKey(writeKey);
-      publicKey = keys.keyPair.publicKey;
-      encryptionKey = keys.encryptionKey;
-    } else if (uri.host == 'shared-readonly') {
+      keySet = KeySet(
+        writeKey: writeKey,
+        publicKey: keys.keyPair.publicKey,
+        encryptionKey: keys.encryptionKey,
+      );
+    } else {
+      final parentUri = uri.replace(
+        pathSegments: uri.pathSegments.sublist(0, uri.pathSegments.length - 1),
+      );
+
+      final parentDir = await _getDirectoryMetadataInternal(parentUri);
+
+      if (!parentDir.directories.containsKey(uri.pathSegments.last)) {
+        throw 'Directory $uri does not exist';
+      }
+
+      final dir = parentDir.directories[uri.pathSegments.last]!;
+
+      keySet = KeySet(
+        publicKey: dir.publicKey,
+        writeKey: writeKey,
+        encryptionKey: dir.encryptionKey,
+      );
+    }
+
+    /* 
+    final keys = [dir.publicKey, dir.encryptionKey]; */
+
+    keySetCache[uri] = keySet;
+
+    // return keys;
+
+    /* else if (uri.host == 'shared-readonly') {
       final keys = await getReadKeysForDirectory(uri);
       publicKey = keys[0]!;
       encryptionKey = keys[1];
     } else {
       throw 'Unsupported URI';
-    }
+    } */
 
-    api.registryListen(publicKey).listen((sre) async {
-      final cached = dirCache.get(Multihash(publicKey));
+    /*   final userInfo = uri.userInfo;
+      if (userInfo.startsWith('r:')) {
+        userId = uri.host;
+        final rootPathSeed = hex.encode(
+          base64Url.decode(
+            userInfo.substring(2),
+          ),
+        );
+        final path = [...uri.pathSegments, 'index.json'].join('/');
+
+        log('userId $userId');
+        log('rootPathSeed $rootPathSeed');
+        log('path $path');
+
+        pathSeed = deriveEncryptedPathSeed(
+          rootPathSeed,
+          path,
+          false,
+        );
+      } else if (userInfo.startsWith('rw:')) {
+        final skynetUser = await _getSkynetUser(userInfo);
+        userId = skynetUser.id;
+
+        final path = [...uri.pathSegments, 'index.json'].join('/');
+
+        pathSeed = await mysky_io_impl.getEncryptedPathSeed(
+          path,
+          false,
+          skynetUser.rawSeed,
+        );
+      } else {
+        throw 'Invalid URI';
+      } */
+
+    return keySet;
+  }
+
+  void listenForDirectoryChanges(Uri uri) async {
+    if (_activeListeningURIs.contains(uri)) return;
+    _activeListeningURIs.add(uri);
+
+    final ks = await getKeySet(uri);
+
+    api.registryListen(ks.publicKey).listen((sre) async {
+      final cached = dirCache.get(Multihash(ks.publicKey));
 
       final cid = CID.fromBytes(sre.data.sublist(1));
 
@@ -443,15 +527,17 @@ class FileSystemDAC {
         final contentRes = await api.downloadRawFile(cid.hash);
 
         final dirMeta = DirectoryMetadata.deserizalize(
-          await decryptMutableBytes(
-            contentRes,
-            encryptionKey!,
-            crypto: crypto,
-          ),
+          ks.encryptionKey == null
+              ? contentRes
+              : await decryptMutableBytes(
+                  contentRes,
+                  ks.encryptionKey!,
+                  crypto: crypto,
+                ),
         );
 
         dirCache.set(
-          Multihash(publicKey),
+          Multihash(ks.publicKey),
           CachedDirectoryMetadata(
             data: dirMeta,
             revision: sre.revision,
@@ -459,7 +545,7 @@ class FileSystemDAC {
           ),
         );
 
-        getDirectoryMetadataChangeNotifier(Multihash(publicKey))
+        getDirectoryMetadataChangeNotifier(Multihash(ks.publicKey))
             .updateDirectoryMetadata(dirMeta);
       }
     });
@@ -952,7 +1038,7 @@ class FileSystemDAC {
 
     for (final task in tasks) {
       try {
-        final r = await task.operation(directoryIndex, res.writeKey!);
+        final r = await task.operation(directoryIndex, res.ks.writeKey!);
         if (r != false) {
           doUpdate = true;
         }
@@ -973,14 +1059,14 @@ class FileSystemDAC {
     if (doUpdate) {
       final cipherText = await encryptMutableBytes(
         directoryIndex.serialize(),
-        res.encryptionKey!,
+        res.ks.encryptionKey!,
         crypto: crypto,
       );
 
       final cid = await api.uploadRawFile(cipherText);
 
       if (uri.host == 'root' || uri.host == 'shared-readwrite') {
-        final kp = await crypto.newKeyPairEd25519(seed: res.secretKey!);
+        final kp = await crypto.newKeyPairEd25519(seed: res.ks.writeKey!);
 
         final sre = await signRegistryEntry(
           kp: kp,
@@ -1307,7 +1393,7 @@ class FileSystemDAC {
 
   final privateKeyCache = <Uri, Uint8List>{};
 
-  Future<Uint8List> getPrivateKeyForDirectory(Uri uri) async {
+  Future<Uint8List?> getPrivateKeyForDirectory(Uri uri) async {
     if (privateKeyCache.containsKey(uri)) {
       return privateKeyCache[uri]!;
     }
@@ -1315,8 +1401,12 @@ class FileSystemDAC {
     if (uri.pathSegments.isEmpty) {
       if (uri.host == 'root') {
         return filesystemRootKey;
-      } else {
+      } else if (uri.host == 'shared-readonly') {
+        return null;
+      } else if (uri.host == 'shared-readwrite') {
         return base64UrlNoPaddingDecode(uri.userInfo);
+      } else {
+        return null;
       }
     }
 
@@ -1325,6 +1415,9 @@ class FileSystemDAC {
     );
 
     final parentKeyBytes = await getPrivateKeyForDirectory(parentUri);
+
+    if (parentKeyBytes == null) return null;
+
     final parentDir = await _getDirectoryMetadataInternal(parentUri);
 
     if (!parentDir.directories.containsKey(uri.pathSegments.last)) {
@@ -1334,58 +1427,33 @@ class FileSystemDAC {
     final encryptedWriteKey =
         parentDir.directories[uri.pathSegments.last]!.encryptedWriteKey;
 
+    if (encryptedWriteKey.isEmpty) {
+      return null;
+    }
+
     if (encryptedWriteKey[0] != 0x01) {
       throw 'Unsupported encryption algorithm';
     }
 
     final nonce = encryptedWriteKey.sublist(1, 25);
 
-    final key = await crypto.decryptXChaCha20Poly1305(
-      ciphertext: encryptedWriteKey.sublist(25),
-      nonce: nonce,
-      key: parentKeyBytes,
-    );
+    try {
+      final key = await crypto.decryptXChaCha20Poly1305(
+        ciphertext: encryptedWriteKey.sublist(25),
+        nonce: nonce,
+        key: parentKeyBytes,
+      );
+      privateKeyCache[uri] = key;
 
-    privateKeyCache[uri] = key;
-
-    return key;
+      return key;
+    } catch (e, st) {
+      print(e);
+      print(st);
+      return null;
+    }
   }
 
-  final sharedReadKeyCache = <Uri, List<Uint8List?>>{};
-
-  Future<List<Uint8List?>> getReadKeysForDirectory(Uri uri) async {
-    if (uri.host != 'shared-readonly') {
-      throw 'Unsupported URI (host)';
-    }
-    if (sharedReadKeyCache.containsKey(uri)) {
-      return sharedReadKeyCache[uri]!;
-    }
-
-    if (uri.pathSegments.isEmpty) {
-      final parts = uri.userInfo.split(':');
-      return [
-        base64UrlNoPaddingDecode(parts[0]),
-        base64UrlNoPaddingDecode(parts[1]),
-      ];
-    }
-
-    final parentUri = uri.replace(
-      pathSegments: uri.pathSegments.sublist(0, uri.pathSegments.length - 1),
-    );
-
-    final parentDir = await _getDirectoryMetadataInternal(parentUri);
-
-    if (!parentDir.directories.containsKey(uri.pathSegments.last)) {
-      throw 'Directory $uri does not exist';
-    }
-
-    final dir = parentDir.directories[uri.pathSegments.last]!;
-    final keys = [dir.publicKey, dir.encryptionKey];
-
-    sharedReadKeyCache[uri] = keys;
-
-    return keys;
-  }
+  final keySetCache = <Uri, KeySet>{};
 
   Future<KeyResponse> deriveKeysFromWriteKey(Uint8List writeKey) async {
     // TODO Cache
@@ -1616,6 +1684,31 @@ class FileSystemDAC {
     if (!res.success) throw res.error!;
   }
 
+  Future<void> mountDirectory(String path, DirectoryReference ref) async {
+    final uri = parsePath(path);
+
+    validateAccess(
+      uri,
+      read: true,
+      write: true,
+    );
+
+    validateFileSystemEntityName(ref.name);
+
+    log('mountDirectory $uri ${ref.name} [skapp: $skapp]');
+
+    final res = await doOperationOnDirectory(
+      uri,
+      (directoryIndex, writeKey) async {
+        if (directoryIndex.directories.containsKey(ref.name))
+          throw 'Directory already contains a subdirectory with the same name';
+
+        directoryIndex.directories[ref.name] = ref;
+      },
+    );
+    if (!res.success) throw res.error!;
+  }
+
   Future<void> deleteDirectory(
     String path,
     String name,
@@ -1748,18 +1841,12 @@ class FileSystemDAC {
       write: false,
     );
 
-    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
-      final writeKey = await getPrivateKeyForDirectory(uri);
+    final keySet = await getKeySet(uri);
 
-      final keys = await deriveKeysFromWriteKey(writeKey);
-      final publicKey = keys.keyPair.publicKey;
-      final encryptionKey = keys.encryptionKey;
-
-      return 'skyfs://${base64UrlNoPaddingEncode(publicKey)}:${base64UrlNoPaddingEncode(encryptionKey)}@shared-readonly';
-    } else if (uri.host == 'shared-readonly') {
+    if (uri.host == 'shared-readonly') {
       return uri.toString();
     } else {
-      throw 'Sharing already shared URIs is not supported yet';
+      return 'skyfs://${base64UrlNoPaddingEncode(keySet.publicKey)}${keySet.encryptionKey == null ? '' : (':' + base64UrlNoPaddingEncode(keySet.encryptionKey!))}@shared-readonly';
     }
   }
 
@@ -1774,7 +1861,7 @@ class FileSystemDAC {
 
     if (uri.host == 'root' || uri.host == 'shared-readwrite') {
       final writeKey = await getPrivateKeyForDirectory(uri);
-      return 'skyfs://${base64UrlNoPaddingEncode(writeKey)}@shared-readwrite';
+      return 'skyfs://${base64UrlNoPaddingEncode(writeKey!)}@shared-readwrite';
     } else if (uri.host == 'shared-readonly') {
       throw 'Generating a read-write share URI for a read-only share URI is not possible';
     } else {
@@ -2228,7 +2315,8 @@ class FileSystemDAC {
                   await crypto.encryptXChaCha20Poly1305(
                 key: writeKey,
                 nonce: nonce,
-                plaintext: oldEncryptedWriteKey,
+                // TODO Null check
+                plaintext: oldEncryptedWriteKey!,
               );
 
               dir.encryptedWriteKey = Uint8List.fromList(
@@ -3029,70 +3117,21 @@ class FileSystemDAC {
     Uri uri,
     Multihash uriHash,
   ) async {
-    log('getRawDataEncryptedWithUri $uri');
+    log('getDirectoryMetadataWithUri $uri');
 
     // late String userId;
     // late String pathSeed;
 
-    Uint8List? writeKey;
-
+    /* Uint8List? writeKey;
     late final Uint8List publicKey;
-    Uint8List? secretKey;
-    late final Uint8List? encryptionKey;
+    late final Uint8List? encryptionKey; */
 
-    if (uri.host == 'root' || uri.host == 'shared-readwrite') {
-      writeKey = await getPrivateKeyForDirectory(uri);
-
-      final keys = await deriveKeysFromWriteKey(writeKey);
-      publicKey = keys.keyPair.publicKey;
-      secretKey = writeKey;
-      encryptionKey = keys.encryptionKey;
-    } else if (uri.host == 'shared-readonly') {
-      final keys = await getReadKeysForDirectory(uri);
-      publicKey = keys[0]!;
-      encryptionKey = keys[1];
-
-      /*   final userInfo = uri.userInfo;
-      if (userInfo.startsWith('r:')) {
-        userId = uri.host;
-        final rootPathSeed = hex.encode(
-          base64Url.decode(
-            userInfo.substring(2),
-          ),
-        );
-        final path = [...uri.pathSegments, 'index.json'].join('/');
-
-        log('userId $userId');
-        log('rootPathSeed $rootPathSeed');
-        log('path $path');
-
-        pathSeed = deriveEncryptedPathSeed(
-          rootPathSeed,
-          path,
-          false,
-        );
-      } else if (userInfo.startsWith('rw:')) {
-        final skynetUser = await _getSkynetUser(userInfo);
-        userId = skynetUser.id;
-
-        final path = [...uri.pathSegments, 'index.json'].join('/');
-
-        pathSeed = await mysky_io_impl.getEncryptedPathSeed(
-          path,
-          false,
-          skynetUser.rawSeed,
-        );
-      } else {
-        throw 'Invalid URI';
-      } */
-    } else {
-      throw 'Unsupported URI';
-    }
+    final ks = await getKeySet(uri);
 
     /* final dataKey = deriveEncryptedFileTweak(pathSeed);
     final encryptionKey = deriveEncryptedFileKeyEntropy(pathSeed); */
 
-    final res = await api.registryGet(publicKey);
+    final res = await api.registryGet(ks.publicKey);
 
     if (res == null) {
       return DataWithRevisionAndKeys(
@@ -3103,10 +3142,7 @@ class FileSystemDAC {
           extraMetadata: ExtraMetadata({}),
         ),
         -1,
-        writeKey: writeKey,
-        encryptionKey: encryptionKey,
-        publicKey: publicKey,
-        secretKey: secretKey,
+        ks: ks,
         cid: null,
       );
     }
@@ -3117,35 +3153,31 @@ class FileSystemDAC {
       collectedSkylinks.add(cid.encode());
     } */
 
-    final cached = dirCache.get(Multihash(publicKey));
+    final cached = dirCache.get(Multihash(ks.publicKey));
 
     if (res.revision > (cached?.revision ?? -1)) {
       final contentRes = await api.downloadRawFile(cid.hash);
 
       return DataWithRevisionAndKeys<DirectoryMetadata>(
         DirectoryMetadata.deserizalize(
-          await decryptMutableBytes(
-            contentRes,
-            encryptionKey!,
-            crypto: crypto,
-          ),
+          ks.encryptionKey == null
+              ? contentRes
+              : await decryptMutableBytes(
+                  contentRes,
+                  ks.encryptionKey!,
+                  crypto: crypto,
+                ),
         ),
         res.revision,
         cid: cid,
-        writeKey: writeKey,
-        secretKey: secretKey,
-        encryptionKey: encryptionKey,
-        publicKey: publicKey,
+        ks: ks,
       );
     } else {
       return DataWithRevisionAndKeys(
         cached!.data,
         cached.revision,
         cid: cached.cid,
-        writeKey: writeKey,
-        secretKey: secretKey,
-        encryptionKey: encryptionKey,
-        publicKey: publicKey,
+        ks: ks,
       );
     }
   }
@@ -3321,6 +3353,18 @@ class UploadingFilesChangeNotifier
   }
 }
 
+class KeySet {
+  final Uint8List publicKey;
+  final Uint8List? writeKey;
+  final Uint8List? encryptionKey;
+
+  KeySet({
+    required this.publicKey,
+    required this.writeKey,
+    required this.encryptionKey,
+  });
+}
+
 class EncryptAndUploadResponse {
   final Multihash encryptedBlobHash;
   final Uint8List? secretKey;
@@ -3409,19 +3453,12 @@ class DataWithRevisionAndKeys<T> {
   final int revision;
   final CID? cid;
 
-  final Uint8List? writeKey;
-
-  final Uint8List? secretKey;
-  final Uint8List publicKey;
-  final Uint8List? encryptionKey;
+  final KeySet ks;
 
   DataWithRevisionAndKeys(
     this.data,
     this.revision, {
-    required this.secretKey,
-    required this.writeKey,
-    required this.publicKey,
-    required this.encryptionKey,
+    required this.ks,
     required this.cid,
   });
 
