@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:lib5/lib5.dart';
-import 'package:messagepack/messagepack.dart';
+import 'package:s5_msgpack/s5_msgpack.dart';
 
 class CachedDirectoryMetadata {
   final DirectoryMetadata data;
