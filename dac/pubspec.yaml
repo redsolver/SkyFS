@@ -1,13 +1,12 @@
 name: filesystem_dac
 description: FS DAC for S5
-version: 0.8.0
+version: 0.9.0
 
 environment:
-  sdk: ">=2.12.0 <3.0.0"
+  sdk: ^3.0.0
 
 dependencies:
-  lib5:
-    git: https://github.com/s5-dev/lib5.git
+  lib5: ^0.1.0
   convert: ^3.0.1
   crypto: ^3.0.1
   hive: ^2.0.4
