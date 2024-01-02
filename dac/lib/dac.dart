@@ -424,7 +424,8 @@ class FileSystemDAC {
         return KeySet(
           publicKey: base64UrlNoPaddingDecode(parts[0]),
           writeKey: null,
-          encryptionKey: base64UrlNoPaddingDecode(parts[1]),
+          encryptionKey:
+              parts.length < 2 ? null : base64UrlNoPaddingDecode(parts[1]),
         );
       }
     }
